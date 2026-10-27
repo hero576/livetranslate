@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="light">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -191,9 +191,28 @@
       <input type="range" id="rngRate" min="0.6" max="1.6" step="0.1" value="1.0">
     </label>
     <label class="block-field">
-      <span>字号 <b id="fontVal">中</b></span>
-      <input type="range" id="rngFont" min="80" max="180" step="10" value="100">
+      <span>字号 <b id="fontVal">小</b></span>
+      <input type="range" id="rngFont" min="80" max="180" step="10" value="80">
     </label>
+    <label class="block-field">
+      <span>界面主题</span>
+      <select id="selTheme">
+        <option value="light">浅色（默认）</option>
+        <option value="dark">深色</option>
+      </select>
+    </label>
+    <div class="account-box">
+      <h3>账号</h3>
+      <p>当前用户：<b id="accName">—</b></p>
+      <label class="block-field"><span>当前密码</span>
+        <input type="password" id="pwCur" placeholder="输入当前密码" autocomplete="off"></label>
+      <label class="block-field"><span>新密码（至少 6 位）</span>
+        <input type="password" id="pwNew" placeholder="输入新密码" autocomplete="off"></label>
+      <label class="block-field"><span>确认新密码</span>
+        <input type="password" id="pwNew2" placeholder="再次输入新密码" autocomplete="off"></label>
+      <div id="pwMsg" class="auth-msg"></div>
+      <button class="primary-btn" id="btnChangePw">修改密码</button>
+    </div>
     <div class="tips">
       <p><b>方言识别：</b>语音识别支持普通话、粤语、英语等；把「识别语言」设为对应方言效果最佳。纯方言建议让对方说普通话。</p>
       <p><b>会话记录：</b>翻译内容实时同步到服务器，按用户隔离；新建/改名/切换对话方便回查。</p>

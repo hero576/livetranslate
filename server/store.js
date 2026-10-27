@@ -135,6 +135,13 @@ async function touchLogin(id) {
   await pool.query("UPDATE users SET last_login_at = ? WHERE id = ?", [now(), id]);
 }
 
+async function updatePassword(id, newPassword) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const passHash = hashPassword(newPassword, salt);
+  await pool.query("UPDATE users SET pass_hash = ?, salt = ? WHERE id = ?", [passHash, salt, id]);
+  return true;
+}
+
 /* ---------------------------- 会话 ---------------------------- */
 async function listConversations(userId) {
   const [rows] = await pool.query(
@@ -293,6 +300,7 @@ export {
   listUsers,
   setUserStatus,
   touchLogin,
+  updatePassword,
   listConversations,
   getConversation,
   createConversation,

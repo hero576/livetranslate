@@ -38,7 +38,8 @@ body {
   height: 100dvh;
   display: flex;
   flex-direction: column;
-  max-width: 1080px;
+  max-width: 1560px;
+  width: 100%;
   margin: 0 auto;
   padding: env(safe-area-inset-top) 0 0;
 }
@@ -761,3 +762,100 @@ input[type="range"]::-webkit-slider-thumb {
   .content .panel { margin: 0 0 8px; }
   .content .typebox { margin: 0 0 8px; }
 }
+
+/* ================= 浅色主题 ================= */
+:root[data-theme="light"] {
+  --bg: #f4f6fb;
+  --bg-soft: #ffffff;
+  --card: #ffffff;
+  --card-2: #eef1f7;
+  --line: #dde3ee;
+  --fg: #1a2233;
+  --fg-dim: #6b7280;
+  --accent: #2f7df6;
+  --accent-2: #6366f1;
+  --ok: #16a34a;
+  --rec: #e11d48;
+}
+
+:root[data-theme="light"] body {
+  background:
+    radial-gradient(900px 500px at 12% -10%, rgba(47,125,246,.10), transparent 60%),
+    radial-gradient(800px 500px at 92% 0%, rgba(99,102,241,.08), transparent 60%),
+    var(--bg);
+}
+
+:root[data-theme="light"] .auth-overlay {
+  background:
+    radial-gradient(900px 500px at 15% -10%, rgba(47,125,246,.12), transparent 60%),
+    radial-gradient(800px 500px at 90% 0%, rgba(99,102,241,.10), transparent 60%),
+    var(--bg);
+}
+
+/* 输入框 / 选择器 */
+:root[data-theme="light"] select,
+:root[data-theme="light"] input[type="text"],
+:root[data-theme="light"] input[type="password"],
+:root[data-theme="light"] .typebox input {
+  background-color: #ffffff;
+  color: var(--fg);
+  border-color: var(--line);
+}
+:root[data-theme="light"] .ghost-btn { background: #ffffff; color: #6b7280; }
+
+/* 面板 / 侧栏 */
+:root[data-theme="light"] .panel,
+:root[data-theme="light"] .sidebar {
+  background: linear-gradient(180deg, #ffffff, #fbfcfe);
+  border-color: var(--line);
+}
+:root[data-theme="light"] .row.secondary { border-top-color: rgba(0,0,0,.06); }
+
+/* 认证 tab / 后台 tab */
+:root[data-theme="light"] .auth-tabs,
+:root[data-theme="light"] .admin-tab,
+:root[data-theme="light"] .conv-count {
+  background: #eef1f7;
+}
+:root[data-theme="light"] .auth-tab { color: #6b7280; }
+:root[data-theme="light"] .auth-tab.active { background: #ffffff; color: var(--fg); box-shadow: 0 1px 3px rgba(0,0,0,.06); }
+:root[data-theme="light"] .admin-tab { color: #6b7280; border-color: var(--line); }
+:root[data-theme="light"] .admin-tab.active { color: var(--fg); background: rgba(47,125,246,.10); border-color: var(--accent); }
+
+/* 开关 */
+:root[data-theme="light"] .switch input + span::before { background: #cbd5e1; box-shadow: inset 0 0 0 1px rgba(0,0,0,.04); }
+
+/* 文本 / 气泡 */
+:root[data-theme="light"] .src-line { color: #6b7280; }
+:root[data-theme="light"] .tgt-line { color: var(--fg); border-color: rgba(47,125,246,.20); background: linear-gradient(135deg, rgba(47,125,246,.06), rgba(99,102,241,.04)); }
+:root[data-theme="light"] .live-text { color: var(--fg); }
+:root[data-theme="light"] .live-area { background: rgba(0,0,0,.025); border-color: rgba(0,0,0,.12); }
+:root[data-theme="light"] .conv-item { color: var(--fg); }
+:root[data-theme="light"] .conv-empty { color: #9aa3b2; }
+:root[data-theme="light"] .badge { color: #2563eb; background: rgba(47,125,246,.12); border-color: rgba(47,125,246,.22); }
+:root[data-theme="light"] .time, :root[data-theme="light"] .status, :root[data-theme="light"] .tagline { color: #8b95a8; }
+:root[data-theme="light"] .empty h2 { color: var(--fg); }
+
+/* 提示框 / 记录 */
+:root[data-theme="light"] .tips { background: rgba(0,0,0,.03); border-color: rgba(0,0,0,.07); }
+:root[data-theme="light"] .tips b { color: #374151; }
+:root[data-theme="light"] .record-msg { background: rgba(0,0,0,.03); }
+:root[data-theme="light"] .admin-row { border-bottom-color: rgba(0,0,0,.06); }
+:root[data-theme="light"] .stat { background: #ffffff; border-color: var(--line); }
+
+/* 滚动条 */
+:root[data-theme="light"] .transcript { scrollbar-color: #cbd5e1 transparent; }
+:root[data-theme="light"] .conv-list { scrollbar-color: #cbd5e1 transparent; }
+
+/* 抽屉遮罩 */
+:root[data-theme="light"] .drawer { background: rgba(15,23,42,.4); }
+
+/* 大字幕模式保持深色，保证投屏对比度 */
+:root[data-theme="light"] .cinema { background: #05070b; }
+
+/* 账号框 */
+.account-box { margin: 16px 0; padding: 14px; border-radius: 12px; background: rgba(0,0,0,.03); border: 1px solid rgba(0,0,0,.06); }
+:root[data-theme="dark"] .account-box { background: rgba(255,255,255,.03); border-color: rgba(255,255,255,.07); }
+.account-box h3 { font-size: 13px; margin-bottom: 10px; color: var(--fg); }
+.account-box p { font-size: 12px; color: var(--fg-dim); margin-bottom: 10px; }
+.account-box .primary-btn { margin-top: 4px; }

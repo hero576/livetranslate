@@ -101,6 +101,18 @@ app.get("/api/auth/me", requireAuth, (req, res) => {
   res.json({ ok: true, user: publicUser(req.user) });
 });
 
+/** 修改密码 */
+app.post("/api/auth/password", requireAuth, async (req, res) => {
+  const { current, next } = req.body || {};
+  if (!current || !next) return res.status(400).json({ ok: false, error: "请输入当前密码和新密码" });
+  if (String(next).length < 6) return res.status(400).json({ ok: false, error: "新密码至少 6 位" });
+  if (!store.verifyPassword(req.user, current)) {
+    return res.status(400).json({ ok: false, error: "当前密码错误" });
+  }
+  await store.updatePassword(req.user.id, next);
+  res.json({ ok: true, message: "密码已更新" });
+});
+
 /* ---------------------------- 会话 API ---------------------------- */
 app.get("/api/conv", requireAuth, async (req, res) => {
   res.json({ ok: true, conversations: await store.listConversations(req.user.id) });

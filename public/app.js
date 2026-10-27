@@ -34,6 +34,8 @@ const els = {
   liveText: $("liveText"), liveLang: $("liveLang"), status: $("status"),
   drawer: $("drawer"), help: $("help"), btnCloseDrawer: $("btnCloseDrawer"), btnCloseHelp: $("btnCloseHelp"),
   rngRate: $("rngRate"), rateVal: $("rateVal"), rngFont: $("rngFont"), fontVal: $("fontVal"),
+  selTheme: $("selTheme"), accName: $("accName"), pwCur: $("pwCur"), pwNew: $("pwNew"),
+  pwNew2: $("pwNew2"), pwMsg: $("pwMsg"), btnChangePw: $("btnChangePw"),
   adminPanel: $("adminPanel"), adminBody: $("adminBody"), btnCloseAdmin: $("btnCloseAdmin"),
   cinema: $("cinema"), cinemaBody: $("cinemaBody"), btnExitCinema: $("btnExitCinema"),
 };
@@ -144,6 +146,7 @@ function enterApp() {
   els.authOverlay.hidden = true;
   els.app.hidden = false;
   els.userName.textContent = state.user.username;
+  els.accName.textContent = state.user.username;
   els.userAvatar.textContent = state.user.username.slice(0, 1).toUpperCase();
   if (state.user.role === "admin") els.btnAdmin.hidden = false;
   loadConversations();
@@ -579,6 +582,7 @@ function saveSettings() {
   localStorage.setItem("lt.settings", JSON.stringify({
     tgt: els.selTgt.value, mode: els.selMode.value, engine: els.selEngine.value,
     voiceURI: els.selVoice.value, rate: els.rngRate.value, font: els.rngFont.value,
+    theme: els.selTheme.value,
   }));
 }
 function loadSettings() {
@@ -590,7 +594,14 @@ function loadSettings() {
     if (s.voiceURI) els.selVoice.dataset.want = s.voiceURI;
     if (s.rate) { els.rngRate.value = s.rate; els.rateVal.textContent = Number(s.rate).toFixed(1) + "x"; }
     if (s.font) { els.rngFont.value = s.font; applyFont(s.font); }
-  } catch { /* ignore */ }
+    applyTheme(s.theme || "light");
+  } catch { applyTheme("light"); }
+}
+
+function applyTheme(t) {
+  const theme = t === "dark" ? "dark" : "light";
+  document.documentElement.dataset.theme = theme;
+  if (els.selTheme) els.selTheme.value = theme;
 }
 function applyFont(v) {
   const scale = v / 100;
@@ -607,10 +618,30 @@ els.btnSwap.onclick = () => {
 };
 
 [els.selTgt, els.selMode, els.selEngine].forEach((el) => el.addEventListener("change", saveSettings));
+els.selTheme.addEventListener("change", () => { applyTheme(els.selTheme.value); saveSettings(); });
 els.selSrc.addEventListener("change", () => { if (state.listening) { try { state.recognition.stop(); } catch { /* onend restart */ } } });
 els.rngRate.addEventListener("input", () => { els.rateVal.textContent = Number(els.rngRate.value).toFixed(1) + "x"; saveSettings(); });
 els.rngFont.addEventListener("input", () => { applyFont(Number(els.rngFont.value)); saveSettings(); });
 els.selVoice.addEventListener("change", () => { localStorage.setItem("lt.voice", els.selVoice.value); saveSettings(); });
+
+/* 修改密码 */
+els.btnChangePw.onclick = async () => {
+  const cur = els.pwCur.value, next = els.pwNew.value, next2 = els.pwNew2.value;
+  if (!cur || !next) { els.pwMsg.textContent = "请填写当前密码和新密码"; return; }
+  if (next !== next2) { els.pwMsg.textContent = "两次输入的新密码不一致"; return; }
+  if (next.length < 6) { els.pwMsg.textContent = "新密码至少 6 位"; return; }
+  els.btnChangePw.disabled = true;
+  els.pwMsg.textContent = "修改中…";
+  try {
+    const d = await api("/api/auth/password", { method: "POST", body: JSON.stringify({ current: cur, next }) });
+    els.pwMsg.textContent = "✅ " + (d.message || "密码已更新");
+    els.pwCur.value = els.pwNew.value = els.pwNew2.value = "";
+  } catch (e) {
+    els.pwMsg.textContent = "⚠️ " + e.message;
+  } finally {
+    els.btnChangePw.disabled = false;
+  }
+};
 
 els.btnSettings.onclick = () => (els.drawer.hidden = false);
 els.btnHelp.onclick = () => (els.help.hidden = false);
