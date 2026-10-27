@@ -935,3 +935,24 @@ html, body { overflow-x: hidden; }
   .stat-grid { grid-template-columns: repeat(2, 1fr); }
   .brand .tagline { display: none; }
 }
+
+/* 修正重译输入框 */
+.edit-src-input {
+  width: 100%;
+  padding: 8px 10px;
+  font-size: 13.5px;
+  line-height: 1.5;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  background: var(--bg-soft);
+  color: var(--fg);
+  font-family: var(--font);
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(79,140,255,.12);
+}
+.copy-mini { font-family: var(--font); }
+
+/* 触屏设备上让「✎ 修正」按钮常显 */
+@media (max-width: 720px) {
+  .copy-mini { opacity: 1; }
+}

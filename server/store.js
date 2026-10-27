@@ -243,6 +243,14 @@ async function addMessage({ convId, userId, src, tgt, fromLang, toLang, engine }
   return msg;
 }
 
+async function updateMessage(id, userId, { src, tgt, fromLang, toLang, engine }) {
+  const [r] = await pool.query(
+    "UPDATE messages SET src=?, tgt=?, from_lang=?, to_lang=?, engine=? WHERE id=? AND user_id=?",
+    [src, tgt, fromLang || null, toLang || null, engine || null, id, userId]
+  );
+  return r.affectedRows > 0;
+}
+
 /* ---------------------------- 统计（管理员） ---------------------------- */
 async function stats() {
   const [[u]] = await pool.query("SELECT COUNT(*) AS c FROM users");
@@ -308,6 +316,7 @@ export {
   deleteConversation,
   listMessages,
   addMessage,
+  updateMessage,
   stats,
   usage,
   getMessagesByConv,

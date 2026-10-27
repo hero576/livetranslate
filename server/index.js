@@ -161,7 +161,26 @@ app.post("/api/conv/:id/messages", requireAuth, async (req, res) => {
       })
     );
   }
-  res.json({ ok: true, saved: saved.length });
+  res.json({ ok: true, saved: saved.length, ids: saved.map((m) => m.id) });
+});
+
+/** 修正重译：更新某条消息的原文/译文 */
+app.patch("/api/conv/:id/messages/:msgId", requireAuth, async (req, res) => {
+  const c = await store.getConversation(req.params.id);
+  if (!c || c.userId !== req.user.id) return res.status(404).json({ ok: false, error: "会话不存在" });
+  const { src, tgt, fromLang, toLang, engine } = req.body || {};
+  if (typeof src !== "string" || typeof tgt !== "string") {
+    return res.status(400).json({ ok: false, error: "src/tgt required" });
+  }
+  const ok = await store.updateMessage(req.params.msgId, req.user.id, {
+    src: src.slice(0, 2000),
+    tgt: tgt.slice(0, 4000),
+    fromLang: fromLang || null,
+    toLang: toLang || null,
+    engine: engine || null,
+  });
+  if (!ok) return res.status(404).json({ ok: false, error: "消息不存在" });
+  res.json({ ok: true });
 });
 
 /* ---------------------------- 管理员 API ---------------------------- */

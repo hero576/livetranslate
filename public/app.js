@@ -57,6 +57,8 @@ const state = {
   queue: Promise.resolve(),
   voices: [],
   started: false,
+  lastInterim: "",
+  interimCommitted: 0,
 };
 
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -266,10 +268,10 @@ function deleteConv(c) {
 }
 
 /* ---------------------------- 消息同步 ---------------------------- */
-function syncMessage(m) {
-  ensureConversation()
-    .then((id) => api(`/api/conv/${id}/messages`, { method: "POST", body: JSON.stringify(m) }))
-    .catch(() => {});
+async function syncMessage(m) {
+  const id = await ensureConversation();
+  const d = await api(`/api/conv/${id}/messages`, { method: "POST", body: JSON.stringify(m) });
+  return d.ids && d.ids[0] ? d.ids[0] : null;
 }
 
 /* ---------------------------- 语音识别 ---------------------------- */
@@ -293,12 +295,17 @@ function buildRecognition() {
       else interim += (interim ? " " : "") + txt;
     }
     if (interim) {
+      state.lastInterim = interim;
       els.liveArea.hidden = false;
-      els.liveText.textContent = interim;
+      els.liveText.textContent = interim.slice(state.interimCommitted);
       els.liveLang.textContent = "正在听…";
       els.emptyState.style.display = "none";
+      // 断句优化：interim 过长或遇到句末标点时，提前把已完整的一部分提交出去，避免长句卡死丢内容
+      commitInterimChunk(interim);
     }
     if (finalized) {
+      state.lastInterim = "";
+      state.interimCommitted = 0;
       els.liveText.textContent = "";
       handleFinal(finalized);
     }
@@ -317,6 +324,9 @@ function buildRecognition() {
   };
 
   rec.onend = () => {
+    // 先把尚未定稿的 interim 也提交，避免长句在静音/重启时丢掉后半段
+    flushInterim();
+
     if (state.manualStop) {
       state.listening = false;
       els.liveArea.hidden = true;
@@ -341,6 +351,44 @@ function recognitionLang() {
   const v = els.selSrc.value;
   if (v === "auto") return navigator.language || "zh-CN";
   return BCP47[v] || v;
+}
+
+/* 断句优化：interim 是「当前这句」的累积文本，随着说话持续增长。
+   当它够长或遇到句末标点时，把已完整的一部分提前提交，避免：
+   - 超长句把识别引擎撑爆后只吐出开头一小段；
+   - 静音结束/自动重启时把后半段丢掉。 */
+function commitInterimChunk(interim) {
+  const uncommitted = interim.slice(state.interimCommitted);
+  if (uncommitted.length < 40) return;
+
+  let cut = -1;
+  for (const p of ["。", "！", "？", "!", "?", "；", ";", "\n", "."]) {
+    const i = uncommitted.lastIndexOf(p);
+    if (i > cut) cut = i;
+  }
+
+  if (cut < 6) {
+    // 没有句末标点：找最后一个空格；再不行就超长硬切
+    const sp = uncommitted.lastIndexOf(" ");
+    if (sp > 24) cut = sp;
+    else if (uncommitted.length >= 90) cut = 89;
+    else return;
+  }
+
+  const text = uncommitted.slice(0, cut + 1).trim();
+  if (text.length >= 4) {
+    handleFinal(text);
+    state.interimCommitted += cut + 1;
+    els.liveText.textContent = interim.slice(state.interimCommitted);
+  }
+}
+
+/* 把当前还没提交的 interim 尾巴也送出去 */
+function flushInterim() {
+  const rest = (state.lastInterim || "").slice(state.interimCommitted).trim();
+  state.lastInterim = "";
+  state.interimCommitted = 0;
+  if (rest.length >= 2) handleFinal(rest);
 }
 
 function handleFinal(text) {
@@ -384,6 +432,7 @@ function enqueueTranslate(text, isSpeech = false) {
 async function doTranslate(text, isSpeech) {
   const tgtLang = els.selTgt.value;
   const node = createBlock(text);
+  node.src = text;
   state.translating++;
   updateBusy();
 
@@ -397,14 +446,14 @@ async function doTranslate(text, isSpeech) {
     const fromLabel = d.detected && LANG_NAME[d.detected] ? LANG_NAME[d.detected] : d.detected;
     if (fromLabel) node.badge.textContent = d.skipped ? `${fromLabel}（已是目标语言）` : `${fromLabel} → ${LANG_NAME[tgtLang] || tgtLang}`;
 
-    // 实时同步到服务器
-    syncMessage({
+    // 实时同步到服务器，记录消息 id 以便「修正重译」时原地更新
+    node.msgId = await syncMessage({
       src: text,
       tgt: d.text,
       fromLang: d.detected || null,
       toLang: tgtLang,
       engine: d.engine,
-    });
+    }).catch(() => null);
 
     if (els.chkAuto.checked) speak(d.text, tgtLang);
     if (!els.cinema.hidden) appendCinema(text, d.text);
@@ -440,8 +489,15 @@ function createBlock(src) {
   time.textContent = new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   meta.append(badge, time);
 
+  const editBtn = document.createElement("button");
+  editBtn.className = "copy-mini";
+  editBtn.textContent = "✎ 修正";
+  editBtn.title = "识别不准？点此改原文后重译";
+  meta.appendChild(editBtn);
+
+  let srcLine = null;
   if (els.chkDual.checked) {
-    const srcLine = document.createElement("div");
+    srcLine = document.createElement("div");
     srcLine.className = "src-line";
     srcLine.textContent = src;
     wrap.appendChild(meta);
@@ -457,7 +513,81 @@ function createBlock(src) {
 
   els.transcript.appendChild(wrap);
   scrollToBottom();
-  return { wrap, tgtEl, badge };
+
+  const node = { wrap, tgtEl, badge, srcLine, editBtn, src };
+  editBtn.onclick = () => startEdit(node);
+  return node;
+}
+
+/* 修正重译：把原文行变成输入框，用户改完回车重新翻译（解决中英混说单词识别错的问题） */
+function startEdit(node) {
+  if (node._editing) return;
+  node._editing = true;
+
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "edit-src-input";
+  input.value = node.src;
+
+  // 防重入：replaceWith 移除输入框会同步触发 blur，若不先摘掉 onblur
+  // 会再次调用 commit()，第二次 replaceWith 抛错并中断整个重译流程
+  const detach = () => { input.onblur = null; input.onkeydown = null; };
+
+  const commit = async () => {
+    if (!node._editing) return;
+    node._editing = false;
+    detach();
+    const newSrc = input.value.trim();
+    const changed = newSrc && newSrc !== node.src;
+    if (changed) { node.src = newSrc; if (node.srcLine) node.srcLine.textContent = newSrc; }
+    if (node.srcLine) { input.replaceWith(node.srcLine); }
+    else { input.remove(); }
+    if (!changed) return;
+
+    // 重新翻译
+    const tgtLang = els.selTgt.value;
+    node.tgtEl.textContent = "重新翻译中…";
+    node.tgtEl.classList.add("loading");
+    try {
+      const d = await api("/api/translate", {
+        method: "POST",
+        body: JSON.stringify({ text: newSrc, from: "auto", to: tgtLang, engine: els.selEngine.value }),
+      });
+      node.tgtEl.textContent = d.text;
+      node.tgtEl.classList.remove("loading");
+      const fromLabel = d.detected && LANG_NAME[d.detected] ? LANG_NAME[d.detected] : d.detected;
+      if (fromLabel) node.badge.textContent = d.skipped ? `${fromLabel}（已是目标语言）` : `${fromLabel} → ${LANG_NAME[tgtLang] || tgtLang}`;
+
+      // 原地更新服务器记录（不新增）
+      if (node.msgId && state.currentConvId) {
+        api(`/api/conv/${state.currentConvId}/messages/${node.msgId}`, {
+          method: "PATCH",
+          body: JSON.stringify({ src: newSrc, tgt: d.text, fromLang: d.detected || null, toLang: tgtLang, engine: d.engine }),
+        }).catch(() => {});
+      }
+    } catch (err) {
+      node.tgtEl.textContent = "翻译失败：" + (err.message || "请检查网络");
+      node.tgtEl.classList.remove("loading");
+    }
+  };
+
+  const cancel = () => {
+    if (!node._editing) return;
+    node._editing = false;
+    detach();
+    if (node.srcLine) input.replaceWith(node.srcLine);
+    else input.remove();
+  };
+
+  input.onkeydown = (e) => {
+    if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); commit(); }
+    if (e.key === "Escape") { e.preventDefault(); cancel(); }
+  };
+  input.onblur = () => { if (node._editing) commit(); };
+
+  if (node.srcLine) node.srcLine.replaceWith(input);
+  else node.tgtEl.before(input);
+  input.focus();
 }
 
 function renderMessage(m) {
@@ -471,10 +601,17 @@ function renderMessage(m) {
   const time = document.createElement("span");
   time.className = "time";
   time.textContent = new Date(m.createdAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
-  meta.append(badge, time);
 
+  // 历史消息同样支持「✎ 修正」重译（原地 PATCH 服务器记录）
+  const editBtn = document.createElement("button");
+  editBtn.className = "copy-mini";
+  editBtn.textContent = "✎ 修正";
+  editBtn.title = "识别不准？点此改原文后重译";
+  meta.append(badge, time, editBtn);
+
+  let srcLine = null;
   if (els.chkDual.checked) {
-    const srcLine = document.createElement("div");
+    srcLine = document.createElement("div");
     srcLine.className = "src-line";
     srcLine.textContent = m.src;
     wrap.appendChild(meta);
@@ -487,6 +624,9 @@ function renderMessage(m) {
   tgtEl.textContent = m.tgt;
   wrap.appendChild(tgtEl);
   els.transcript.appendChild(wrap);
+
+  const node = { wrap, tgtEl, badge, srcLine, editBtn, src: m.src, msgId: m.id };
+  editBtn.onclick = () => startEdit(node);
 }
 
 function scrollToBottom() {
@@ -556,6 +696,7 @@ function stopListening(hard = false) {
   state.manualStop = true;
   state.listening = false;
   clearTimeout(state.restartTimer);
+  flushInterim(); // 手动停止也把 interim 尾巴送出去
   if (state.recognition) { try { state.recognition.stop(); } catch { /* ignore */ } }
   renderMic(false);
   flushBuffer(true);
