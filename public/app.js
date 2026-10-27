@@ -1,158 +1,287 @@
 /* =========================================================================
- * LiveTranslate — 前端核心
- *
- * 设计要点：
- * 1) 用 Web Speech API 做实时识别；onend 后自动 restart，突破 Chrome
- *    约 8 秒静音就断的限制 → 实现「不限时长」。
- * 2) 识别结果分两路：interim（临时）只显示在实时区；
- *    final（定稿）才送去翻译并落成一条记录，避免频繁请求。
- * 3) 长句子按标点/长度切块串行翻译，保证顺序和准确度。
- * 4) 全部状态存 localStorage，刷新不丢。
+ * LiveTranslate 前端
+ * 登录/注册 + 会话管理（新建/改名/切换/恢复）+ 实时同步 + 后台管理
  * ========================================================================= */
 
 const $ = (id) => document.getElementById(id);
 
-const els = {
-  selSrc: $("selSrc"),
-  selTgt: $("selTgt"),
-  selMic: $("selMic"),
-  selMode: $("selMode"),
-  selEngine: $("selEngine"),
-  selVoice: $("selVoice"),
-  chkAuto: $("chkAuto"),
-  chkDual: $("chkDual"),
-  btnSwap: $("btnSwap"),
-  txtInput: $("txtInput"),
-  btnSend: $("btnSend"),
-  btnMic: $("btnMic"),
-  btnClear: $("btnClear"),
-  btnExport: $("btnExport"),
-  btnFull: $("btnFull"),
-  btnSettings: $("btnSettings"),
-  btnHelp: $("btnHelp"),
-  btnCloseDrawer: $("btnCloseDrawer"),
-  btnCloseHelp: $("btnCloseHelp"),
-  btnExitCinema: $("btnExitCinema"),
-  drawer: $("drawer"),
-  help: $("help"),
-  transcript: $("transcript"),
-  emptyState: $("emptyState"),
-  liveArea: $("liveArea"),
-  liveText: $("liveText"),
-  liveLang: $("liveLang"),
-  status: $("status"),
-  meter: $("meter"),
-  rngRate: $("rngRate"),
-  rateVal: $("rateVal"),
-  rngFont: $("rngFont"),
-  fontVal: $("fontVal"),
-  cinema: $("cinema"),
-  cinemaBody: $("cinemaBody"),
-};
-
+/* ---------------------------- 常量 ---------------------------- */
+const API = ""; // 同源
 const LANG_NAME = {
   "zh-CN": "中文", "zh-TW": "中文(繁)", en: "English", ja: "日本語", ko: "한국어",
-  fr: "Français", de: "Deutsch", es: "Español", ru: "Русский", ar: "العربية",
-  pt: "Português", th: "ไทย", vi: "Tiếng Việt", mixed: "中英混合",
+  fr: "Français", de: "Deutsch", es: "Español", ru: "Русский", yue: "粤语",
+  mixed: "中英混合",
 };
 
+/* 识别语言 → BCP47（浏览器语音识别用） */
 const BCP47 = {
-  "zh-CN": "zh-CN", "zh-TW": "zh-TW", en: "en-US", ja: "ja-JP", ko: "ko-KR",
-  fr: "fr-FR", de: "de-DE", es: "es-ES", ru: "ru-RU", ar: "ar-SA",
-  pt: "pt-PT", th: "th-TH", vi: "vi-VN",
+  "zh-CN": "zh-CN", "zh-TW": "zh-TW", yue: "yue-Hant-HK", en: "en-US",
+  ja: "ja-JP", ko: "ko-KR", fr: "fr-FR", de: "de-DE", es: "es-ES", ru: "ru-RU",
 };
 
-/* ------------------------------------------------------------------ *
- * 状态
- * ------------------------------------------------------------------ */
+const els = {
+  authOverlay: $("authOverlay"), authForm: $("authForm"), authUser: $("authUser"),
+  authPass: $("authPass"), authMsg: $("authMsg"), authSubmit: $("authSubmit"),
+  authHint: $("authHint"), tabLogin: $("tabLogin"), tabRegister: $("tabRegister"),
+  app: $("app"), btnAdmin: $("btnAdmin"), btnSettings: $("btnSettings"), btnHelp: $("btnHelp"),
+  btnLogout: $("btnLogout"), userAvatar: $("userAvatar"), userName: $("userName"),
+  sidebar: $("sidebar"), convList: $("convList"), btnNewConv: $("btnNewConv"),
+  selSrc: $("selSrc"), selTgt: $("selTgt"), selMode: $("selMode"), selEngine: $("selEngine"),
+  selVoice: $("selVoice"), chkAuto: $("chkAuto"), chkDual: $("chkDual"),
+  btnSwap: $("btnSwap"), btnMic: $("btnMic"), btnClear: $("btnClear"), btnExport: $("btnExport"),
+  btnFull: $("btnFull"), txtInput: $("txtInput"), btnSend: $("btnSend"),
+  transcript: $("transcript"), emptyState: $("emptyState"), liveArea: $("liveArea"),
+  liveText: $("liveText"), liveLang: $("liveLang"), status: $("status"),
+  drawer: $("drawer"), help: $("help"), btnCloseDrawer: $("btnCloseDrawer"), btnCloseHelp: $("btnCloseHelp"),
+  rngRate: $("rngRate"), rateVal: $("rateVal"), rngFont: $("rngFont"), fontVal: $("fontVal"),
+  adminPanel: $("adminPanel"), adminBody: $("adminBody"), btnCloseAdmin: $("btnCloseAdmin"),
+  cinema: $("cinema"), cinemaBody: $("cinemaBody"), btnExitCinema: $("btnExitCinema"),
+};
+
+/* ---------------------------- 状态 ---------------------------- */
 const state = {
+  token: localStorage.getItem("lt.token") || null,
+  user: null,
+  authMode: "login",
+  convs: [],
+  currentConvId: null,
   listening: false,
   manualStop: false,
   recognition: null,
   restartTimer: null,
-  restartCount: 0,
-  finalBuffer: "",       // 当前累积的定稿文本（未提交翻译）
+  finalBuffer: "",
   flushTimer: null,
   translating: 0,
   queue: Promise.resolve(),
   voices: [],
-  history: [],           // { id, src, tgt, lang, ts, engine }
   started: false,
 };
 
-/* ------------------------------------------------------------------ *
- * 本地存储
- * ------------------------------------------------------------------ */
-const SETTINGS_KEY = "lt.settings.v1";
-
-function loadSettings() {
-  try {
-    const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
-    if (s.src) els.selSrc.value = s.src;
-    if (s.tgt) els.selTgt.value = s.tgt;
-    if (s.mode) els.selMode.value = s.mode;
-    if (s.engine) els.selEngine.value = s.engine;
-    if (s.voiceURI !== undefined) els.selVoice.dataset.want = s.voiceURI;
-    if (typeof s.auto === "boolean") els.chkAuto.checked = s.auto;
-    if (typeof s.dual === "boolean") els.chkDual.checked = s.dual;
-    if (s.rate) { els.rngRate.value = s.rate; els.rateVal.textContent = Number(s.rate).toFixed(1) + "x"; }
-    if (s.font) { els.rngFont.value = s.font; applyFont(s.font); }
-  } catch { /* ignore */ }
-}
-
-function saveSettings() {
-  localStorage.setItem(SETTINGS_KEY, JSON.stringify({
-    src: els.selSrc.value,
-    tgt: els.selTgt.value,
-    mode: els.selMode.value,
-    engine: els.selEngine.value,
-    voiceURI: els.selVoice.value,
-    auto: els.chkAuto.checked,
-    dual: els.chkDual.checked,
-    rate: els.rngRate.value,
-    font: els.rngFont.value,
-  }));
-}
-
-function applyFont(v) {
-  const scale = v / 100;
-  document.documentElement.style.setProperty("--tgt-size", (20 * scale).toFixed(1) + "px");
-  const nodes = document.querySelectorAll(".tgt-line");
-  nodes.forEach((n) => (n.style.fontSize = (20 * scale).toFixed(1) + "px"));
-  els.fontVal.textContent = v < 100 ? "小" : v > 100 ? "大" : "中";
-}
-
-/* ------------------------------------------------------------------ *
- * 状态栏
- * ------------------------------------------------------------------ */
-function setStatus(text) {
-  els.status.textContent = text;
-}
-
-/* ------------------------------------------------------------------ *
- * 识别器初始化
- * ------------------------------------------------------------------ */
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 
+/* ---------------------------- API 封装 ---------------------------- */
+async function api(path, opts = {}) {
+  const headers = { "Content-Type": "application/json", ...(opts.headers || {}) };
+  if (state.token) headers.Authorization = "Bearer " + state.token;
+  const res = await fetch(API + path, { ...opts, headers });
+  let data = null;
+  try { data = await res.json(); } catch { /* empty */ }
+  if (res.status === 401) {
+    doLogout(false);
+    throw new Error("未登录");
+  }
+  if (!res.ok) throw new Error((data && data.error) || "请求失败");
+  return data;
+}
+
+/* ---------------------------- 认证 ---------------------------- */
+function setAuthMode(mode) {
+  state.authMode = mode;
+  els.tabLogin.classList.toggle("active", mode === "login");
+  els.tabRegister.classList.toggle("active", mode === "register");
+  els.authSubmit.textContent = mode === "login" ? "登录" : "注册";
+  els.authHint.textContent = mode === "login" ? "没有账号？注册后需管理员审批。" : "已有账号？直接登录。";
+  els.authMsg.textContent = "";
+}
+
+els.tabLogin.onclick = () => setAuthMode("login");
+els.tabRegister.onclick = () => setAuthMode("register");
+
+els.authForm.onsubmit = async (e) => {
+  e.preventDefault();
+  const username = els.authUser.value.trim();
+  const password = els.authPass.value;
+  if (!username || !password) { els.authMsg.textContent = "请输入用户名和密码"; return; }
+  els.authSubmit.disabled = true;
+  els.authMsg.textContent = state.authMode === "login" ? "登录中…" : "注册中…";
+  try {
+    if (state.authMode === "login") {
+      const d = await api("/api/auth/login", { method: "POST", body: JSON.stringify({ username, password }) });
+      state.token = d.token;
+      localStorage.setItem("lt.token", d.token);
+      state.user = d.user;
+      enterApp();
+    } else {
+      const d = await api("/api/auth/register", { method: "POST", body: JSON.stringify({ username, password }) });
+      els.authMsg.textContent = "✅ " + (d.message || "注册成功") + "，请等待管理员审批后登录。";
+      setAuthMode("login");
+    }
+  } catch (err) {
+    els.authMsg.textContent = "⚠️ " + err.message;
+  } finally {
+    els.authSubmit.disabled = false;
+  }
+};
+
+function doLogout(redirect = true) {
+  api("/api/auth/logout", { method: "POST" }).catch(() => {});
+  state.token = null;
+  state.user = null;
+  localStorage.removeItem("lt.token");
+  if (redirect) showAuth();
+}
+
+els.btnLogout.onclick = () => doLogout();
+
+async function initAuth() {
+  if (!state.token) return showAuth();
+  try {
+    const d = await api("/api/auth/me");
+    state.user = d.user;
+    enterApp();
+  } catch {
+    showAuth();
+  }
+}
+
+function showAuth() {
+  els.app.hidden = true;
+  els.authOverlay.hidden = false;
+  setAuthMode("login");
+}
+
+function enterApp() {
+  els.authOverlay.hidden = true;
+  els.app.hidden = false;
+  els.userName.textContent = state.user.username;
+  els.userAvatar.textContent = state.user.username.slice(0, 1).toUpperCase();
+  if (state.user.role === "admin") els.btnAdmin.hidden = false;
+  loadConversations();
+}
+
+/* ---------------------------- 会话管理 ---------------------------- */
+async function loadConversations() {
+  try {
+    const d = await api("/api/conv");
+    state.convs = d.conversations;
+    renderConvList();
+    if (state.convs.length > 0) {
+      selectConversation(state.convs[0].id);
+    } else {
+      // 自动新建一个「对话1」
+      await ensureConversation();
+    }
+  } catch (e) {
+    setStatus("加载会话失败: " + e.message);
+  }
+}
+
+function renderConvList() {
+  els.convList.innerHTML = "";
+  if (!state.convs.length) {
+    els.convList.innerHTML = '<div class="conv-empty">暂无对话</div>';
+    return;
+  }
+  state.convs.forEach((c) => {
+    const item = document.createElement("div");
+    item.className = "conv-item" + (c.id === state.currentConvId ? " active" : "");
+    item.dataset.id = c.id;
+
+    const title = document.createElement("div");
+    title.className = "conv-title";
+    title.textContent = c.title;
+
+    const count = document.createElement("span");
+    count.className = "conv-count";
+    count.textContent = c.msgCount || 0;
+
+    const actions = document.createElement("div");
+    actions.className = "conv-actions";
+    const renameBtn = document.createElement("button");
+    renameBtn.className = "conv-btn"; renameBtn.textContent = "✎"; renameBtn.title = "重命名";
+    renameBtn.onclick = (ev) => { ev.stopPropagation(); renameConv(c); };
+    const delBtn = document.createElement("button");
+    delBtn.className = "conv-btn"; delBtn.textContent = "✕"; delBtn.title = "删除";
+    delBtn.onclick = (ev) => { ev.stopPropagation(); deleteConv(c); };
+    actions.append(renameBtn, delBtn);
+
+    item.append(title, count, actions);
+    item.onclick = () => selectConversation(c.id);
+    els.convList.appendChild(item);
+  });
+}
+
+async function selectConversation(id) {
+  state.currentConvId = id;
+  renderConvList();
+  els.transcript.innerHTML = "";
+  try {
+    const d = await api(`/api/conv/${id}/messages`);
+    d.messages.forEach((m) => renderMessage(m));
+    if (!d.messages.length) {
+      els.emptyState.style.display = "";
+    } else {
+      els.emptyState.style.display = "none";
+    }
+    scrollToBottom();
+  } catch (e) {
+    setStatus("加载对话失败: " + e.message);
+  }
+}
+
+async function ensureConversation() {
+  if (state.currentConvId) return state.currentConvId;
+  const d = await api("/api/conv", { method: "POST", body: JSON.stringify({}) });
+  state.convs.unshift(d.conversation);
+  state.currentConvId = d.conversation.id;
+  renderConvList();
+  return d.conversation.id;
+}
+
+els.btnNewConv.onclick = async () => {
+  try {
+    await ensureConversation();
+    // 强制新建一个全新对话
+    const d = await api("/api/conv", { method: "POST", body: JSON.stringify({}) });
+    state.convs.unshift(d.conversation);
+    state.currentConvId = d.conversation.id;
+    renderConvList();
+    els.transcript.innerHTML = "";
+    els.emptyState.style.display = "";
+  } catch (e) { setStatus(e.message); }
+};
+
+function renameConv(c) {
+  const name = prompt("对话名称：", c.title);
+  if (!name || name === c.title) return;
+  api(`/api/conv/${c.id}`, { method: "PATCH", body: JSON.stringify({ title: name }) })
+    .then(() => loadConversations())
+    .catch((e) => setStatus(e.message));
+}
+
+function deleteConv(c) {
+  if (!confirm(`删除「${c.title}」？其中的翻译记录也会删除。`)) return;
+  api(`/api/conv/${c.id}`, { method: "DELETE" })
+    .then(() => {
+      if (state.currentConvId === c.id) {
+        state.currentConvId = null;
+        els.transcript.innerHTML = "";
+      }
+      loadConversations();
+    })
+    .catch((e) => setStatus(e.message));
+}
+
+/* ---------------------------- 消息同步 ---------------------------- */
+function syncMessage(m) {
+  ensureConversation()
+    .then((id) => api(`/api/conv/${id}/messages`, { method: "POST", body: JSON.stringify(m) }))
+    .catch(() => {});
+}
+
+/* ---------------------------- 语音识别 ---------------------------- */
 function buildRecognition() {
   if (!SpeechRecognition) return null;
   const rec = new SpeechRecognition();
   rec.continuous = true;
   rec.interimResults = true;
-  rec.lang = BCP47[els.selSrc.value] && els.selSrc.value !== "auto"
-    ? BCP47[els.selSrc.value]
-    : (navigator.language || "zh-CN");
+  rec.lang = recognitionLang();
   rec.maxAlternatives = 1;
 
-  rec.onstart = () => {
-    state.restartCount = 0;
-    setStatus("识别中…");
-  };
+  rec.onstart = () => setStatus("识别中…");
 
   rec.onresult = (event) => {
-    let interim = "";
-    let finalized = "";
-
+    let interim = "", finalized = "";
     for (let i = event.resultIndex; i < event.results.length; i++) {
       const r = event.results[i];
       const txt = (r[0]?.transcript || "").trim();
@@ -160,14 +289,12 @@ function buildRecognition() {
       if (r.isFinal) finalized += (finalized ? " " : "") + txt;
       else interim += (interim ? " " : "") + txt;
     }
-
     if (interim) {
       els.liveArea.hidden = false;
       els.liveText.textContent = interim;
       els.liveLang.textContent = "正在听…";
-      if (els.emptyState && !state.started) els.emptyState.style.display = "none";
+      els.emptyState.style.display = "none";
     }
-
     if (finalized) {
       els.liveText.textContent = "";
       handleFinal(finalized);
@@ -175,17 +302,14 @@ function buildRecognition() {
   };
 
   rec.onerror = (e) => {
-    if (e.error === "no-speech" || e.error === "aborted") return; // 正常现象
+    if (e.error === "no-speech" || e.error === "aborted") return;
     if (e.error === "not-allowed" || e.error === "service-not-allowed") {
       setStatus("麦克风被拒绝");
-      alert("麦克风权限被拒绝。请在浏览器地址栏左侧的锁图标里允许麦克风访问，然后刷新页面重试。");
+      alert("麦克风权限被拒绝。请在地址栏左侧锁图标里允许麦克风，然后刷新。");
       stopListening(true);
       return;
     }
-    if (e.error === "network") {
-      setStatus("网络异常，重连中…");
-      return;
-    }
+    if (e.error === "network") { setStatus("网络异常，重连中…"); return; }
     setStatus("识别错误：" + e.error);
   };
 
@@ -198,135 +322,89 @@ function buildRecognition() {
       setStatus("已停止");
       return;
     }
-    // 自动续接 —— 这是「不限时长」的关键
     if (state.listening) {
-      state.restartCount++;
-      const delay = Math.min(120 + state.restartCount * 40, 900);
       clearTimeout(state.restartTimer);
       state.restartTimer = setTimeout(() => {
         if (!state.listening) return;
-        try {
-          rec.lang = state.detectedLang || rec.lang;
-          rec.start();
-          setStatus("识别中…");
-        } catch {
-          /* 已经在运行，忽略 */
-        }
-      }, delay);
+        try { rec.lang = recognitionLang(); rec.start(); setStatus("识别中…"); } catch { /* ignore */ }
+      }, 120);
     }
   };
 
   return rec;
 }
 
-/* ------------------------------------------------------------------ *
- * 定稿文本 → 缓冲 → 提交翻译
- * ------------------------------------------------------------------ */
+function recognitionLang() {
+  const v = els.selSrc.value;
+  if (v === "auto") return navigator.language || "zh-CN";
+  return BCP47[v] || v;
+}
+
 function handleFinal(text) {
   state.started = true;
-  if (els.emptyState) els.emptyState.style.display = "none";
-
+  els.emptyState.style.display = "none";
   state.finalBuffer = (state.finalBuffer + " " + text).replace(/\s+/g, " ").trim();
-
-  // 整句模式：等 1.2 秒静默再翻译；实时模式：等 0.5 秒
   const wait = els.selMode.value === "command" ? 1200 : 520;
   clearTimeout(state.flushTimer);
   state.flushTimer = setTimeout(() => flushBuffer(), wait);
-
   setStatus("识别中…");
 }
 
-/** 把缓冲文本切分并提交翻译 */
 function flushBuffer(force = false) {
   clearTimeout(state.flushTimer);
   const buf = state.finalBuffer.trim();
   if (!buf) return;
-
-  // 太短且不是强制提交时，继续等（避免碎片）
-  if (!force && buf.length < 6) {
-    state.flushTimer = setTimeout(() => flushBuffer(), 900);
-    return;
-  }
-
+  if (!force && buf.length < 6) { state.flushTimer = setTimeout(() => flushBuffer(), 900); return; }
   state.finalBuffer = "";
-  const chunks = splitChunks(buf);
-  chunks.forEach((c) => enqueueTranslate(c));
+  splitChunks(buf).forEach((c) => enqueueTranslate(c, true));
 }
 
-/** 按标点切分长文本，单块不超过 ~180 字符（MyMemory 单次 500 字节限制） */
 function splitChunks(text) {
   const hard = 170;
   if (text.length <= hard) return [text];
-
   const parts = text.split(/(?<=[。！？!?；;.\n])\s*/).filter(Boolean);
   const out = [];
   let cur = "";
   for (const p of parts) {
-    if ((cur + p).length > hard && cur) {
-      out.push(cur.trim());
-      cur = p;
-    } else {
-      cur += p;
-    }
+    if ((cur + p).length > hard && cur) { out.push(cur.trim()); cur = p; }
+    else cur += p;
   }
   if (cur.trim()) out.push(cur.trim());
-
-  // 极端情况：仍超长，硬切
-  return out.flatMap((s) =>
-    s.length <= hard ? [s] : s.match(new RegExp(`.{1,${hard}}`, "gs")) || [s]
-  );
+  return out.flatMap((s) => s.length <= hard ? [s] : s.match(new RegExp(`.{1,${hard}}`, "gs")) || [s]);
 }
 
-/** 串行翻译队列，保证顺序 */
-function enqueueTranslate(text) {
-  state.queue = state.queue.then(() => doTranslate(text)).catch(() => {});
+function enqueueTranslate(text, isSpeech = false) {
+  state.queue = state.queue.then(() => doTranslate(text, isSpeech)).catch(() => {});
   return state.queue;
 }
 
-async function doTranslate(text) {
-  const srcLang = els.selSrc.value;
+async function doTranslate(text, isSpeech) {
   const tgtLang = els.selTgt.value;
-
-  const node = createBlock(text, srcLang, tgtLang);
+  const node = createBlock(text);
   state.translating++;
   updateBusy();
 
   try {
-    const r = await fetch("/api/translate", {
+    const d = await api("/api/translate", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        text,
-        from: srcLang === "auto" ? "auto" : srcLang,
-        to: tgtLang,
-        engine: els.selEngine.value,
-      }),
+      body: JSON.stringify({ text, from: "auto", to: tgtLang, engine: els.selEngine.value }),
     });
-    const data = await r.json();
-    if (!data.ok) throw new Error(data.error || "translate failed");
-
-    node.tgtEl.textContent = data.text;
+    node.tgtEl.textContent = d.text;
     node.tgtEl.classList.remove("loading");
-    node.engine = data.engine;
+    const fromLabel = d.detected && LANG_NAME[d.detected] ? LANG_NAME[d.detected] : d.detected;
+    if (fromLabel) node.badge.textContent = d.skipped ? `${fromLabel}（已是目标语言）` : `${fromLabel} → ${LANG_NAME[tgtLang] || tgtLang}`;
 
-    // 自动检测到语言后，更新气泡标签（让用户知道系统识别成了什么语言）
-    if (data.detected && node.badge) {
-      const fromLabel = LANG_NAME[data.detected] || data.detected;
-      node.badge.textContent = data.skipped
-        ? `${fromLabel}（已是目标语言，无需翻译）`
-        : `${fromLabel} → ${LANG_NAME[tgtLang] || tgtLang}`;
-      if (data.detected !== els.selTgt.value) {
-        node.badge.title = `识别为 ${fromLabel}（引擎 ${data.engine}）`;
-      }
-    }
+    // 实时同步到服务器
+    syncMessage({
+      src: text,
+      tgt: d.text,
+      fromLang: d.detected || null,
+      toLang: tgtLang,
+      engine: d.engine,
+    });
 
-    // 记录历史
-    const rec = { id: node.id, src: text, tgt: data.text, lang: tgtLang, ts: Date.now() };
-    state.history.push(rec);
-
-    if (els.chkAuto.checked) speak(data.text, tgtLang);
-
-    if (!els.cinema.hidden) appendCinema(text, data.text);
+    if (els.chkAuto.checked) speak(d.text, tgtLang);
+    if (!els.cinema.hidden) appendCinema(text, d.text);
   } catch (err) {
     node.tgtEl.textContent = "翻译失败：" + (err.message || "请检查网络");
     node.tgtEl.classList.remove("loading");
@@ -343,28 +421,20 @@ function updateBusy() {
   else if (state.listening) setStatus("识别中…");
 }
 
-/* ------------------------------------------------------------------ *
- * DOM 渲染
- * ------------------------------------------------------------------ */
+/* ---------------------------- 渲染 ---------------------------- */
 let blockSeq = 0;
 
-function createBlock(src, srcLang, tgtLang) {
-  const id = ++blockSeq + "-" + Date.now();
+function createBlock(src) {
   const wrap = document.createElement("div");
   wrap.className = "block";
-  wrap.dataset.id = id;
-
   const meta = document.createElement("div");
   meta.className = "meta";
-
   const badge = document.createElement("span");
   badge.className = "badge";
-  badge.textContent = `${LANG_NAME[srcLang] || "自动"} → ${LANG_NAME[tgtLang] || tgtLang}`;
-
+  badge.textContent = "翻译中…";
   const time = document.createElement("span");
   time.className = "time";
   time.textContent = new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-
   meta.append(badge, time);
 
   if (els.chkDual.checked) {
@@ -382,34 +452,52 @@ function createBlock(src, srcLang, tgtLang) {
   tgtEl.textContent = "翻译中…";
   wrap.appendChild(tgtEl);
 
-  const copyBtn = document.createElement("button");
-  copyBtn.className = "copy-mini";
-  copyBtn.textContent = "复制原文";
-  copyBtn.onclick = () => navigator.clipboard?.writeText(src);
-  meta.appendChild(copyBtn);
-
   els.transcript.appendChild(wrap);
   scrollToBottom();
+  return { wrap, tgtEl, badge };
+}
 
-  return { id, wrap, tgtEl, badge };
+function renderMessage(m) {
+  const wrap = document.createElement("div");
+  wrap.className = "block";
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  const badge = document.createElement("span");
+  badge.className = "badge";
+  badge.textContent = `${LANG_NAME[m.fromLang] || "原文"} → ${LANG_NAME[m.toLang] || m.toLang || ""}`;
+  const time = document.createElement("span");
+  time.className = "time";
+  time.textContent = new Date(m.createdAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+  meta.append(badge, time);
+
+  if (els.chkDual.checked) {
+    const srcLine = document.createElement("div");
+    srcLine.className = "src-line";
+    srcLine.textContent = m.src;
+    wrap.appendChild(meta);
+    wrap.appendChild(srcLine);
+  } else {
+    wrap.appendChild(meta);
+  }
+  const tgtEl = document.createElement("div");
+  tgtEl.className = "tgt-line";
+  tgtEl.textContent = m.tgt;
+  wrap.appendChild(tgtEl);
+  els.transcript.appendChild(wrap);
 }
 
 function scrollToBottom() {
-  requestAnimationFrame(() => {
-    els.transcript.scrollTop = els.transcript.scrollHeight;
-  });
+  requestAnimationFrame(() => { els.transcript.scrollTop = els.transcript.scrollHeight; });
 }
 
 function renderMic(on) {
   els.btnMic.classList.toggle("rec", on);
-  els.meter.classList.toggle("on", on);
 }
 
-/* ------------------------------------------------------------------ *
- * 语音合成（朗读译文）
- * ------------------------------------------------------------------ */
-let voiceList = [];
+function setStatus(text) { els.status.textContent = text; }
 
+/* ---------------------------- 语音合成 ---------------------------- */
+let voiceList = [];
 function loadVoices() {
   if (!("speechSynthesis" in window)) return;
   voiceList = speechSynthesis.getVoices();
@@ -423,226 +511,124 @@ function loadVoices() {
   });
   if (want) els.selVoice.value = want;
 }
-
 function pickVoice(lang) {
   const bcp = BCP47[lang] || lang;
-  const chosenURI = els.selVoice.value;
-  if (chosenURI) {
-    const v = voiceList.find((x) => x.voiceURI === chosenURI);
+  if (els.selVoice.value) {
+    const v = voiceList.find((x) => x.voiceURI === els.selVoice.value);
     if (v) return v;
   }
-  const exact = voiceList.find((v) => v.lang.replace("_", "-").toLowerCase() === bcp.toLowerCase());
-  if (exact) return exact;
-  const prefix = bcp.split("-")[0].toLowerCase();
-  return voiceList.find((v) => v.lang.toLowerCase().startsWith(prefix)) || null;
+  return voiceList.find((v) => v.lang.replace("_", "-").toLowerCase() === String(bcp).toLowerCase()) || null;
 }
-
 function speak(text, lang) {
   if (!("speechSynthesis" in window)) return;
-  // 避免堆积：每当有新的译文，取消旧的（会议场景更实用）
   speechSynthesis.cancel();
   const u = new SpeechSynthesisUtterance(text);
   u.lang = BCP47[lang] || lang;
   const v = pickVoice(lang);
   if (v) u.voice = v;
   u.rate = Number(els.rngRate.value) || 1;
-  u.pitch = 1;
   speechSynthesis.speak(u);
 }
 
-/* ------------------------------------------------------------------ *
- * 麦克风电平表（视觉反馈）
- * ------------------------------------------------------------------ */
-let audioCtx, analyser, meterRAF, micStream;
-
-async function startMeter() {
-  try {
-    if (!micStream) {
-      micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    }
-    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
-    const src = audioCtx.createMediaStreamSource(micStream);
-    analyser = audioCtx.createAnalyser();
-    analyser.fftSize = 256;
-    analyser.smoothingTimeConstant = 0.75;
-    src.connect(analyser);
-
-    const bars = [...els.meter.children];
-    const buf = new Uint8Array(analyser.frequencyBinCount);
-
-    const tick = () => {
-      if (!state.listening) return;
-      analyser.getByteFrequencyData(buf);
-      bars.forEach((bar, i) => {
-        const idx = Math.floor((i / bars.length) * buf.length * 0.6) + 2;
-        const h = 5 + (buf[idx] / 255) * 22;
-        bar.style.height = h.toFixed(1) + "px";
-      });
-      meterRAF = requestAnimationFrame(tick);
-    };
-    cancelAnimationFrame(meterRAF);
-    tick();
-  } catch {
-    /* 没有电平表也能用 */
-  }
-}
-
-function stopMeter() {
-  cancelAnimationFrame(meterRAF);
-  [...els.meter.children].forEach((b) => (b.style.height = "6px"));
-}
-
-/* ------------------------------------------------------------------ *
- * 启动 / 停止
- * ------------------------------------------------------------------ */
+/* ---------------------------- 开始/停止 ---------------------------- */
 async function startListening() {
   if (!SpeechRecognition) {
-    alert(
-      "当前浏览器不支持语音识别。\n\n请使用 Chrome 或 Edge 浏览器打开本页面（Safari / Firefox 支持不佳）。"
-    );
+    alert("请使用 Chrome / Edge 浏览器打开。");
     return;
   }
-
   state.manualStop = false;
   state.listening = true;
-  state.started = true;
-  if (els.emptyState) els.emptyState.style.transform = "scale(.98)";
-
-  try {
-    // 先请求麦克风，确保权限弹窗
-    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  } catch {
-    alert("无法访问麦克风，请检查系统权限设置。");
-    state.listening = false;
-    return;
-  }
+  try { await navigator.mediaDevices.getUserMedia({ audio: true }); }
+  catch { alert("无法访问麦克风，请检查系统权限设置。"); state.listening = false; return; }
 
   state.recognition = buildRecognition();
-  try {
-    state.recognition.start();
-  } catch (e) {
-    console.warn(e);
-  }
-
+  try { state.recognition.start(); } catch (e) { console.warn(e); }
   els.liveArea.hidden = false;
   els.liveText.textContent = "";
   renderMic(true);
-  startMeter();
   setStatus("识别中…");
-  els.btnMic.setAttribute("aria-label", "停止");
 }
 
 function stopListening(hard = false) {
   state.manualStop = true;
   state.listening = false;
   clearTimeout(state.restartTimer);
-  if (state.recognition) {
-    try { state.recognition.stop(); } catch { /* ignore */ }
-  }
-  if (hard && micStream) {
-    micStream.getTracks().forEach((t) => t.stop());
-    micStream = null;
-  }
-  stopMeter();
+  if (state.recognition) { try { state.recognition.stop(); } catch { /* ignore */ } }
   renderMic(false);
   flushBuffer(true);
   els.liveArea.hidden = true;
   setStatus("已停止");
-  els.btnMic.setAttribute("aria-label", "开始");
 }
 
-/* ------------------------------------------------------------------ *
- * 事件绑定
- * ------------------------------------------------------------------ */
-els.btnMic.addEventListener("click", () => {
-  if (state.listening) stopListening();
-  else startListening();
-});
+els.btnMic.onclick = () => state.listening ? stopListening() : startListening();
 
-/* 手动输入：方言说不准时直接打字翻译 */
+/* ---------------------------- 手动输入 ---------------------------- */
 function submitTyped() {
   const text = els.txtInput.value.trim();
   if (!text) return;
   els.txtInput.value = "";
-  if (els.emptyState) els.emptyState.style.display = "none";
+  els.emptyState.style.display = "none";
   state.started = true;
-  enqueueTranslate(text);
+  enqueueTranslate(text, false);
+}
+els.btnSend.onclick = submitTyped;
+els.txtInput.onkeydown = (e) => { if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); submitTyped(); } };
+
+/* ---------------------------- 设置 ---------------------------- */
+function saveSettings() {
+  localStorage.setItem("lt.settings", JSON.stringify({
+    tgt: els.selTgt.value, mode: els.selMode.value, engine: els.selEngine.value,
+    voiceURI: els.selVoice.value, rate: els.rngRate.value, font: els.rngFont.value,
+  }));
+}
+function loadSettings() {
+  try {
+    const s = JSON.parse(localStorage.getItem("lt.settings") || "{}");
+    if (s.tgt) els.selTgt.value = s.tgt;
+    if (s.mode) els.selMode.value = s.mode;
+    if (s.engine) els.selEngine.value = s.engine;
+    if (s.voiceURI) els.selVoice.dataset.want = s.voiceURI;
+    if (s.rate) { els.rngRate.value = s.rate; els.rateVal.textContent = Number(s.rate).toFixed(1) + "x"; }
+    if (s.font) { els.rngFont.value = s.font; applyFont(s.font); }
+  } catch { /* ignore */ }
+}
+function applyFont(v) {
+  const scale = v / 100;
+  document.querySelectorAll(".tgt-line").forEach((n) => (n.style.fontSize = (20 * scale).toFixed(1) + "px"));
+  els.fontVal.textContent = v < 100 ? "小" : v > 100 ? "大" : "中";
 }
 
-els.btnSend.addEventListener("click", submitTyped);
-els.txtInput.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.isComposing) {
-    e.preventDefault();
-    submitTyped();
-  }
-});
-
-els.btnSwap.addEventListener("click", () => {
+els.btnSwap.onclick = () => {
   const s = els.selSrc.value, t = els.selTgt.value;
-  els.selSrc.value = t === "zh-CN" ? "en" : t;
-  els.selTgt.value = s === "auto" ? "zh-CN" : s;
+  els.selSrc.value = t === "zh-CN" ? "en" : (t === "en" ? "zh-CN" : "auto");
+  els.selTgt.value = (s === "auto" || s === "yue") ? "zh-CN" : s;
   saveSettings();
-  restartIfListening();
-});
+  if (state.listening) { try { state.recognition.stop(); } catch { /* restart onend */ } }
+};
 
-function restartIfListening() {
-  if (!state.listening) return;
-  try { state.recognition.stop(); } catch { /* onend 会自动重启并应用新语言 */ }
-}
-
-[els.selSrc, els.selTgt, els.selMode, els.selEngine].forEach((el) =>
-  el.addEventListener("change", saveSettings)
-);
-[els.chkAuto, els.chkDual].forEach((el) => {
-  el.addEventListener("change", () => {
-    saveSettings();
-    // 重绘已有气泡的显示模式
-    document.querySelectorAll(".block").forEach((b) => {});
-  });
-});
-
-els.selSrc.addEventListener("change", () => {
-  saveSettings();
-  restartIfListening();
-});
-
-els.rngRate.addEventListener("input", () => {
-  els.rateVal.textContent = Number(els.rngRate.value).toFixed(1) + "x";
-  saveSettings();
-});
-
-els.rngFont.addEventListener("input", () => {
-  applyFont(Number(els.rngFont.value));
-  saveSettings();
-});
-
-els.selVoice.addEventListener("change", () => {
-  localStorage.setItem("lt.voice", els.selVoice.value);
-  saveSettings();
-});
+[els.selTgt, els.selMode, els.selEngine].forEach((el) => el.addEventListener("change", saveSettings));
+els.selSrc.addEventListener("change", () => { if (state.listening) { try { state.recognition.stop(); } catch { /* onend restart */ } } });
+els.rngRate.addEventListener("input", () => { els.rateVal.textContent = Number(els.rngRate.value).toFixed(1) + "x"; saveSettings(); });
+els.rngFont.addEventListener("input", () => { applyFont(Number(els.rngFont.value)); saveSettings(); });
+els.selVoice.addEventListener("change", () => { localStorage.setItem("lt.voice", els.selVoice.value); saveSettings(); });
 
 els.btnSettings.onclick = () => (els.drawer.hidden = false);
 els.btnHelp.onclick = () => (els.help.hidden = false);
 els.btnCloseDrawer.onclick = () => (els.drawer.hidden = true);
 els.btnCloseHelp.onclick = () => (els.help.hidden = true);
-[els.drawer, els.help].forEach((d) =>
-  d.addEventListener("click", (e) => {
-    if (e.target === d) d.hidden = true;
-  })
-);
+[els.drawer, els.help, els.adminPanel].forEach((d) => d.addEventListener("click", (e) => { if (e.target === d) d.hidden = true; }));
 
 els.btnClear.onclick = () => {
-  if (!confirm("清空全部记录？")) return;
+  if (!confirm("清空当前视图？(不会删除服务器记录)")) return;
   els.transcript.innerHTML = "";
-  state.history = [];
-  blockSeq = 0;
+  els.emptyState.style.display = "";
 };
 
-els.btnExport.onclick = () => {
-  if (!state.history.length) return alert("还没有内容可导出");
-  const lines = state.history.map(
-    (h) => `[${new Date(h.ts).toLocaleString("zh-CN")}] ${h.src}\n→ ${h.tgt}\n`
-  );
+els.btnExport.onclick = async () => {
+  if (!state.currentConvId) return alert("暂无对话");
+  const d = await api(`/api/conv/${state.currentConvId}/messages`).catch(() => null);
+  if (!d || !d.messages.length) return alert("当前对话没有内容");
+  const lines = d.messages.map((m) => `[${new Date(m.createdAt).toLocaleString("zh-CN")}] ${m.src}\n→ ${m.tgt}\n`);
   const blob = new Blob([lines.join("\n")], { type: "text/plain;charset=utf-8" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
@@ -655,80 +641,150 @@ els.btnFull.onclick = () => {
   if (els.cinema.hidden) {
     els.cinema.hidden = false;
     els.cinemaBody.innerHTML = "";
-    // 把已有译文带进大字幕
-    const last = state.history.slice(-6);
-    last.forEach((h) => appendCinema(h.src, h.tgt));
     document.documentElement.requestFullscreen?.().catch(() => {});
   } else {
     els.cinema.hidden = true;
     if (document.fullscreenElement) document.exitFullscreen?.();
   }
 };
-
-els.btnExitCinema.onclick = () => {
-  els.cinema.hidden = true;
-  if (document.fullscreenElement) document.exitFullscreen?.();
-};
+els.btnExitCinema.onclick = () => { els.cinema.hidden = true; if (document.fullscreenElement) document.exitFullscreen?.(); };
 
 function appendCinema(src, tgt) {
-  const s = document.createElement("div");
-  s.className = "src";
-  s.textContent = src;
-  const t = document.createElement("div");
-  t.textContent = tgt;
+  const s = document.createElement("div"); s.className = "src"; s.textContent = src;
+  const t = document.createElement("div"); t.textContent = tgt;
   els.cinemaBody.append(s, t);
-  // 只保留最后 8 组，防止卡顿
-  while (els.cinemaBody.children.length > 16) {
-    els.cinemaBody.firstElementChild.remove();
-  }
+  while (els.cinemaBody.children.length > 16) els.cinemaBody.firstElementChild.remove();
   els.cinema.scrollTop = els.cinema.scrollHeight;
 }
 
-/* 键盘快捷键：空格开始/停止，Esc 退出大字幕 */
 document.addEventListener("keydown", (e) => {
   if (e.target.matches("input, select, textarea")) return;
-  if (e.code === "Space") {
-    e.preventDefault();
-    els.btnMic.click();
-  }
-  if (e.key === "Escape") {
-    els.cinema.hidden = true;
-    els.drawer.hidden = true;
-    els.help.hidden = true;
-  }
+  if (e.code === "Space") { e.preventDefault(); els.btnMic.click(); }
+  if (e.key === "Escape") { els.cinema.hidden = true; els.drawer.hidden = true; els.help.hidden = true; }
 });
 
-/* 页面关闭前清理 */
-window.addEventListener("beforeunload", () => {
-  state.manualStop = true;
-  try { state.recognition?.stop(); } catch { /* ignore */ }
-});
+/* ---------------------------- 后台管理 ---------------------------- */
+els.btnAdmin.onclick = () => { els.adminPanel.hidden = false; loadAdmin("users"); };
 
-/* ------------------------------------------------------------------ *
- * 初始化
- * ------------------------------------------------------------------ */
+document.querySelectorAll(".admin-tab").forEach((tab) => {
+  tab.onclick = () => {
+    document.querySelectorAll(".admin-tab").forEach((t) => t.classList.remove("active"));
+    tab.classList.add("active");
+    loadAdmin(tab.dataset.view);
+  };
+});
+els.btnCloseAdmin.onclick = () => (els.adminPanel.hidden = true);
+
+async function loadAdmin(view) {
+  els.adminBody.innerHTML = '<div class="admin-loading">加载中…</div>';
+  try {
+    if (view === "users") {
+      const d = await api("/api/admin/users");
+      els.adminBody.innerHTML = "";
+      const list = document.createElement("div");
+      d.users.forEach((u) => {
+        const row = document.createElement("div");
+        row.className = "admin-row";
+        const info = document.createElement("div");
+        info.innerHTML = `<b>${u.username}</b> ${u.role === "admin" ? '<span class="badge">管理员</span>' : ""} <span class="admin-status s-${u.status}">${u.status === "active" ? "已通过" : u.status === "pending" ? "待审批" : "已拒绝"}</span><br><small>对话 ${u.conversations} · 消息 ${u.messages}</small>`;
+        const ops = document.createElement("div");
+        if (u.role !== "admin" && u.status === "pending") {
+          const ok = document.createElement("button"); ok.className = "mini-ok"; ok.textContent = "通过";
+          ok.onclick = () => setUserStatus(u.id, "active");
+          const no = document.createElement("button"); no.className = "mini-no"; no.textContent = "拒绝";
+          no.onclick = () => setUserStatus(u.id, "rejected");
+          ops.append(ok, no);
+        } else if (u.role !== "admin" && u.status === "active") {
+          const dis = document.createElement("button"); dis.className = "mini-no"; dis.textContent = "禁用";
+          dis.onclick = () => setUserStatus(u.id, "rejected");
+          ops.append(dis);
+        }
+        row.append(info, ops);
+        list.appendChild(row);
+      });
+      els.adminBody.appendChild(list);
+    } else if (view === "stats") {
+      const d = await api("/api/admin/stats");
+      const s = d.stats;
+      els.adminBody.innerHTML = `
+        <div class="stat-grid">
+          <div class="stat"><b>${s.totalUsers}</b><span>总用户</span></div>
+          <div class="stat"><b>${s.activeUsers}</b><span>已通过</span></div>
+          <div class="stat"><b>${s.pendingUsers}</b><span>待审批</span></div>
+          <div class="stat"><b>${s.totalConversations}</b><span>对话总数</span></div>
+          <div class="stat"><b>${s.totalMessages}</b><span>翻译条数</span></div>
+        </div>
+        <h3 class="admin-sub">各用户消息量</h3>
+        <div id="perUser"></div>`;
+      const per = $("perUser");
+      Object.entries(s.messagesByUser).forEach(([uid, n]) => {
+        per.innerHTML += `<div class="admin-row"><span>${uid}</span><b>${n} 条</b></div>`;
+      });
+    } else if (view === "records") {
+      const d = await api("/api/admin/users");
+      const userSel = document.createElement("select");
+      userSel.innerHTML = '<option value="">选择用户…</option>';
+      d.users.forEach((u) => {
+        const o = document.createElement("option");
+        o.value = u.id; o.textContent = u.username;
+        userSel.appendChild(o);
+      });
+      userSel.onchange = async () => {
+        if (!userSel.value) return;
+        const u = await api(`/api/admin/usage/${userSel.value}`);
+        const container = $("userRecords");
+        container.innerHTML = `<p>用户 <b>${u.user.username}</b>：对话 ${u.usage.conversations} 个 · 消息 ${u.usage.messages} 条</p>`;
+        const list = document.createElement("div");
+        u.conversations.forEach((c) => {
+          const it = document.createElement("div");
+          it.className = "conv-item clickable";
+          it.innerHTML = `<span class="conv-title">${c.title}</span><span class="conv-count">${c.msgCount}</span>`;
+          it.onclick = async () => {
+            const cd = await api(`/api/admin/conversations/${c.id}`);
+            const box = $("convDetail");
+            box.innerHTML = `<h3 class="admin-sub">${c.title}</h3>`;
+            cd.messages.forEach((m) => {
+              box.innerHTML += `<div class="record-msg"><div class="src-line">${esc(m.src)}</div><div class="tgt-line mini">${esc(m.tgt)}</div></div>`;
+            });
+          };
+          list.appendChild(it);
+        });
+        container.appendChild(list);
+        container.innerHTML += '<div id="convDetail"></div>';
+      };
+      els.adminBody.innerHTML = "";
+      els.adminBody.appendChild(userSel);
+      const container = document.createElement("div");
+      container.id = "userRecords";
+      els.adminBody.appendChild(container);
+    }
+  } catch (e) {
+    els.adminBody.innerHTML = `<div class="admin-error">加载失败: ${e.message}</div>`;
+  }
+}
+
+async function setUserStatus(id, status) {
+  try {
+    await api(`/api/admin/users/${id}/status`, { method: "POST", body: JSON.stringify({ status }) });
+    loadAdmin("users");
+  } catch (e) { alert(e.message); }
+}
+
+function esc(s) {
+  const d = document.createElement("div");
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+/* ---------------------------- 初始化 ---------------------------- */
 function init() {
   loadSettings();
   loadVoices();
-  if ("speechSynthesis" in window) {
-    speechSynthesis.onvoiceschanged = loadVoices;
-  }
+  if ("speechSynthesis" in window) speechSynthesis.onvoiceschanged = loadVoices;
   applyFont(Number(els.rngFont.value) || 100);
-
-  if (!SpeechRecognition) {
-    setStatus("浏览器不支持");
-    els.btnMic.disabled = true;
-    els.emptyState.querySelector("h2").textContent = "请换用 Chrome 或 Edge";
-    els.emptyState.querySelector("p").innerHTML =
-      "当前浏览器不支持 Web Speech API 语音识别。<br>请用 <b>Chrome / Edge</b> 打开本页面。";
-  } else {
-    setStatus("待命");
-  }
-
-  // 恢复历史（同一次会话内刷新也保留，方便长会议）
-  els.selSrc.addEventListener("change", () => {
-    if (els.selSrc.value !== "auto") state.detectedLang = BCP47[els.selSrc.value];
-  });
+  // 自动朗读默认关闭
+  els.chkAuto.checked = false;
+  initAuth();
 }
 
 init();

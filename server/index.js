@@ -1,55 +1,228 @@
 import express from "express";
 import path from "node:path";
+import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
+import * as store from "./store.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(express.json({ limit: "256kb" }));
+app.use(express.json({ limit: "512kb" }));
 app.use(express.static(path.join(__dirname, "..", "public")));
 
-/* ------------------------------------------------------------------ *
- * 翻译引擎
- * 所有引擎都是「免费 / 无需用户自己申请 Key」的公共接口。
- * 按优先级依次尝试，失败自动降级，保证被墙或限流时依然能用。
- * ------------------------------------------------------------------ */
+await store.init();
+await seedAdmin();
 
+/* ------------------------------------------------------------------ *
+ * 认证（内存会话 token，7 天有效；数据落库）
+ * ------------------------------------------------------------------ */
+const SESSIONS = new Map();
+const SESSION_TTL = 7 * 24 * 3600 * 1000;
+
+async function seedAdmin() {
+  if (!(await store.getUserByUsername("hero576"))) {
+    const u = await store.createUser("hero576", "guoming");
+    await store.pool.query("UPDATE users SET role='admin', status='active' WHERE id=?", [u.id]);
+    console.log("[auth] 已创建初始管理员 hero576");
+  }
+}
+
+function tokenOf(req) {
+  const h = req.headers.authorization || "";
+  if (h.startsWith("Bearer ")) return h.slice(7).trim();
+  return null;
+}
+
+async function currentUser(req) {
+  const t = tokenOf(req);
+  if (!t) return null;
+  const s = SESSIONS.get(t);
+  if (!s) return null;
+  if (Date.now() > s.expires) { SESSIONS.delete(t); return null; }
+  return store.getUserById(s.userId);
+}
+
+async function requireAuth(req, res, next) {
+  const u = await currentUser(req);
+  if (!u) return res.status(401).json({ ok: false, error: "未登录" });
+  if (u.status !== "active") return res.status(403).json({ ok: false, error: "账号待审批或被禁用" });
+  req.user = u;
+  next();
+}
+
+function requireAdmin(req, res, next) {
+  if (!req.user || req.user.role !== "admin") {
+    return res.status(403).json({ ok: false, error: "需要管理员权限" });
+  }
+  next();
+}
+
+function publicUser(u) {
+  return { id: u.id, username: u.username, role: u.role, status: u.status, createdAt: u.createdAt };
+}
+
+/* ---------------------------- 认证 API ---------------------------- */
+app.post("/api/auth/login", async (req, res) => {
+  const { username, password } = req.body || {};
+  const u = await store.getUserByUsername(username || "");
+  if (!u || !store.verifyPassword(u, password || "")) {
+    return res.status(401).json({ ok: false, error: "用户名或密码错误" });
+  }
+  if (u.status === "pending") return res.status(403).json({ ok: false, error: "账号待管理员审批" });
+  if (u.status === "rejected") return res.status(403).json({ ok: false, error: "账号注册被拒绝" });
+
+  const token = crypto.randomBytes(24).toString("hex");
+  SESSIONS.set(token, { userId: u.id, expires: Date.now() + SESSION_TTL });
+  await store.touchLogin(u.id);
+  return res.json({ ok: true, token, user: publicUser(u) });
+});
+
+app.post("/api/auth/register", async (req, res) => {
+  const { username, password } = req.body || {};
+  if (!username || !password) return res.status(400).json({ ok: false, error: "用户名和密码不能为空" });
+  if (!/^[a-zA-Z0-9_.-]{3,32}$/.test(username)) {
+    return res.status(400).json({ ok: false, error: "用户名需 3-32 位字母/数字/_./-" });
+  }
+  if (String(password).length < 6) return res.status(400).json({ ok: false, error: "密码至少 6 位" });
+  if (await store.getUserByUsername(username)) return res.status(409).json({ ok: false, error: "用户名已存在" });
+
+  await store.createUser(username, password);
+  return res.json({ ok: true, message: "注册成功，等待管理员审批" });
+});
+
+app.post("/api/auth/logout", (req, res) => {
+  const t = tokenOf(req);
+  if (t) SESSIONS.delete(t);
+  res.json({ ok: true });
+});
+
+app.get("/api/auth/me", requireAuth, (req, res) => {
+  res.json({ ok: true, user: publicUser(req.user) });
+});
+
+/* ---------------------------- 会话 API ---------------------------- */
+app.get("/api/conv", requireAuth, async (req, res) => {
+  res.json({ ok: true, conversations: await store.listConversations(req.user.id) });
+});
+
+app.post("/api/conv", requireAuth, async (req, res) => {
+  const title = (req.body && req.body.title) || undefined;
+  const c = await store.createConversation(req.user.id, title);
+  res.json({ ok: true, conversation: c });
+});
+
+app.patch("/api/conv/:id", requireAuth, async (req, res) => {
+  const c = await store.renameConversation(req.params.id, req.user.id, (req.body || {}).title || "");
+  if (!c) return res.status(404).json({ ok: false, error: "会话不存在" });
+  res.json({ ok: true, conversation: c });
+});
+
+app.delete("/api/conv/:id", requireAuth, async (req, res) => {
+  const ok = await store.deleteConversation(req.params.id, req.user.id);
+  if (!ok) return res.status(404).json({ ok: false, error: "会话不存在" });
+  res.json({ ok: true });
+});
+
+app.get("/api/conv/:id/messages", requireAuth, async (req, res) => {
+  const msgs = await store.listMessages(req.params.id, req.user.id);
+  if (msgs === null) return res.status(404).json({ ok: false, error: "会话不存在" });
+  res.json({ ok: true, messages: msgs });
+});
+
+app.post("/api/conv/:id/messages", requireAuth, async (req, res) => {
+  const c = await store.getConversation(req.params.id);
+  if (!c || c.userId !== req.user.id) return res.status(404).json({ ok: false, error: "会话不存在" });
+  const items = Array.isArray(req.body) ? req.body : [req.body];
+  const saved = [];
+  for (const it of items.slice(0, 50)) {
+    if (!it || typeof it.src !== "string" || typeof it.tgt !== "string") continue;
+    saved.push(
+      await store.addMessage({
+        convId: c.id,
+        userId: req.user.id,
+        src: it.src.slice(0, 2000),
+        tgt: it.tgt.slice(0, 4000),
+        fromLang: it.fromLang || null,
+        toLang: it.toLang || null,
+        engine: it.engine || null,
+      })
+    );
+  }
+  res.json({ ok: true, saved: saved.length });
+});
+
+/* ---------------------------- 管理员 API ---------------------------- */
+app.get("/api/admin/users", requireAuth, requireAdmin, async (req, res) => {
+  const users = [];
+  for (const u of await store.listUsers()) {
+    users.push({ ...u, ...(await store.usage(u.id)) });
+  }
+  res.json({ ok: true, users });
+});
+
+app.post("/api/admin/users/:id/status", requireAuth, requireAdmin, async (req, res) => {
+  const status = (req.body || {}).status;
+  if (!["active", "rejected", "pending"].includes(status)) {
+    return res.status(400).json({ ok: false, error: "非法状态" });
+  }
+  const u = await store.setUserStatus(req.params.id, status);
+  if (!u) return res.status(404).json({ ok: false, error: "用户不存在" });
+  res.json({ ok: true, user: publicUser(u) });
+});
+
+app.get("/api/admin/stats", requireAuth, requireAdmin, async (req, res) => {
+  res.json({ ok: true, stats: await store.stats() });
+});
+
+app.get("/api/admin/usage/:userId", requireAuth, requireAdmin, async (req, res) => {
+  const u = await store.getUserById(req.params.userId);
+  if (!u) return res.status(404).json({ ok: false, error: "用户不存在" });
+  res.json({
+    ok: true,
+    user: publicUser(u),
+    usage: await store.usage(u.id),
+    conversations: await store.listConversations(u.id),
+  });
+});
+
+app.get("/api/admin/conversations/:convId", requireAuth, requireAdmin, async (req, res) => {
+  const c = await store.getConversation(req.params.convId);
+  if (!c) return res.status(404).json({ ok: false, error: "会话不存在" });
+  const owner = await store.getUserById(c.userId);
+  res.json({
+    ok: true,
+    conversation: c,
+    owner: owner ? publicUser(owner) : null,
+    messages: await store.getMessagesByConv(c.id),
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * 翻译引擎（Bing 优先，Google/MyMemory/有道降级）
+ * ------------------------------------------------------------------ */
 const LANG_MAP_GOOGLE = {
-  "zh-CN": "zh-CN",
-  "zh-TW": "zh-TW",
-  en: "en",
-  ja: "ja",
-  ko: "ko",
-  fr: "fr",
-  de: "de",
-  es: "es",
-  ru: "ru",
-  ar: "ar",
-  pt: "pt",
-  it: "it",
-  th: "th",
-  vi: "vi",
+  "zh-CN": "zh-CN", "zh-TW": "zh-TW", en: "en", ja: "ja", ko: "ko", fr: "fr",
+  de: "de", es: "es", ru: "ru", ar: "ar", pt: "pt", it: "it", th: "th", vi: "vi",
 };
 
 const LANG_MAP_MYMEMORY = {
-  "zh-CN": "zh-CN",
-  "zh-TW": "zh-TW",
-  en: "en-GB",
-  ja: "ja-JP",
-  ko: "ko-KR",
-  fr: "fr-FR",
-  de: "de-DE",
-  es: "es-ES",
-  ru: "ru-RU",
-  ar: "ar-SA",
-  pt: "pt-PT",
-  it: "it-IT",
-  th: "th-TH",
-  vi: "vi-VN",
+  "zh-CN": "zh-CN", "zh-TW": "zh-TW", en: "en-GB", ja: "ja-JP", ko: "ko-KR",
+  fr: "fr-FR", de: "de-DE", es: "es-ES", ru: "ru-RU", ar: "ar-SA", pt: "pt-PT",
+  it: "it-IT", th: "th-TH", vi: "vi-VN",
 };
 
-/** 谷歌翻译免费端点（大陆网络通常不可达，作为第一优先，超时 2.5s） */
+const UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+const BING_LANG = {
+  "zh-CN": "zh-Hans", "zh-TW": "zh-Hant", en: "en", ja: "ja", ko: "ko", fr: "fr",
+  de: "de", es: "es", ru: "ru", ar: "ar", pt: "pt", it: "it", th: "th", vi: "vi",
+};
+const BING_LANG_REVERSE = Object.fromEntries(Object.entries(BING_LANG).map(([k, v]) => [v, k]));
+const BING_HOSTS = ["www.bing.com", "cn.bing.com"];
+let bingCred = null;
+
 async function googleTranslate(text, from, to) {
   const sl = LANG_MAP_GOOGLE[from] || "auto";
   const tl = LANG_MAP_GOOGLE[to] || to;
@@ -64,15 +237,10 @@ async function googleTranslate(text, from, to) {
   return { text: out, engine: "google" };
 }
 
-/** MyMemory 公共接口：完全免费，匿名每天 5000 字符，带 email 可到 50000 字符/天 */
-async function myMemoryTranslate(text, from, to, email) {
+async function myMemoryTranslate(text, from, to) {
   const src = LANG_MAP_MYMEMORY[from] || from;
   const tgt = LANG_MAP_MYMEMORY[to] || to;
-  const params = new URLSearchParams({
-    q: text.slice(0, 480), // 单次 500 字节上限，分段在客户端完成
-    langpair: `${src}|${tgt}`,
-  });
-  if (email) params.set("de", email);
+  const params = new URLSearchParams({ q: text.slice(0, 480), langpair: `${src}|${tgt}` });
   const res = await fetch("https://api.mymemory.translated.net/get?" + params, {
     signal: AbortSignal.timeout(6000),
   });
@@ -83,14 +251,9 @@ async function myMemoryTranslate(text, from, to, email) {
   return { text: out, engine: "mymemory" };
 }
 
-/** 有道免费端点（国内可达性好），失败静默 */
 async function youdaoTranslate(text, from, to) {
   const map = { "zh-CN": "zh-CHS", "zh-TW": "zh-CHT", en: "en", ja: "ja", ko: "ko", fr: "fr", de: "de", es: "es", ru: "ru" };
-  const params = new URLSearchParams({
-    q: text,
-    from: map[from] || "auto",
-    to: map[to] || to,
-  });
+  const params = new URLSearchParams({ q: text, from: map[from] || "auto", to: map[to] || to });
   const res = await fetch("https://fanyi.youdao.com/translate?doctype=json&type=AUTO&" + params, {
     signal: AbortSignal.timeout(3500),
     headers: { "User-Agent": "Mozilla/5.0" },
@@ -102,29 +265,6 @@ async function youdaoTranslate(text, from, to) {
   return { text: out, engine: "youdao" };
 }
 
-/* ------------------------------------------------------------------ *
- * Bing（微软翻译）公共 Web 接口
- * 优点：无需 API Key、国内可直连、自带语言检测、质量接近 GPT 级
- * 实现：先 GET /translator 拿到 IG + 反滥用 token，再 POST /ttranslatev3
- * ------------------------------------------------------------------ */
-const UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-
-const BING_LANG = {
-  "zh-CN": "zh-Hans",
-  "zh-TW": "zh-Hant",
-  en: "en", ja: "ja", ko: "ko", fr: "fr", de: "de", es: "es",
-  ru: "ru", ar: "ar", pt: "pt", it: "it", th: "th", vi: "vi",
-};
-const BING_LANG_REVERSE = Object.fromEntries(
-  Object.entries(BING_LANG).map(([k, v]) => [v, k])
-);
-
-let bingCred = null; // { ig, token, key, ts, host, cookies }
-
-/* 国内 IP 用 cn.bing.com，海外 IP 用 www.bing.com；自动探测切换 */
-const BING_HOSTS = ["www.bing.com", "cn.bing.com"];
-
 async function refreshBingCred(host) {
   const res = await fetch(`https://${host}/translator`, {
     headers: { "User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8" },
@@ -132,10 +272,7 @@ async function refreshBingCred(host) {
     signal: AbortSignal.timeout(6000),
   });
   if (!res.ok) throw new Error("bing page " + res.status);
-  // 海外 IP 必须带 Cookie 才能调用 ttranslatev3
-  const cookies = (res.headers.getSetCookie?.() || [])
-    .map((c) => c.split(";")[0])
-    .join("; ");
+  const cookies = (res.headers.getSetCookie?.() || []).map((c) => c.split(";")[0]).join("; ");
   const html = await res.text();
   const ig = (html.match(/IG:"([0-9A-F]+)"/) || [])[1];
   const m = html.match(/params_AbusePreventionHelper\s*=\s*\[(\d+),"([^"]+)"/);
@@ -153,11 +290,8 @@ async function bingTranslate(text, from, to) {
 
   const doPost = async () => {
     const body = new URLSearchParams({
-      fromLang: src,
-      to: tgt,
-      text,
-      token: bingCred.token,
-      key: bingCred.key,
+      fromLang: src, to: tgt, text,
+      token: bingCred.token, key: bingCred.key,
     });
     const r = await fetch(
       `https://${bingCred.host}/ttranslatev3?isVertical=1&IG=${bingCred.ig}&IID=translator.5023.1`,
@@ -179,29 +313,20 @@ async function bingTranslate(text, from, to) {
   };
 
   let data = await doPost();
-  // token 过期或空响应 → 换主机 + 刷新凭据重试
   if (!data?.[0]?.translations && (data?.statusCode === 400 || data?.ShowCaptcha || data?.length === 0)) {
-    const next =
-      BING_HOSTS[(BING_HOSTS.indexOf(bingCred.host) + 1) % BING_HOSTS.length];
+    const next = BING_HOSTS[(BING_HOSTS.indexOf(bingCred.host) + 1) % BING_HOSTS.length];
     await refreshBingCred(next);
     data = await doPost();
   }
   const out = data?.[0]?.translations?.[0]?.text;
   if (!out) throw new Error("bing empty " + JSON.stringify(data).slice(0, 80));
-
   const detected = data?.[0]?.detectedLanguage?.language;
-  return {
-    text: out,
-    engine: "bing",
-    detected: detected ? BING_LANG_REVERSE[detected] || detected : undefined,
-  };
+  return { text: out, engine: "bing", detected: detected ? BING_LANG_REVERSE[detected] || detected : undefined };
 }
 
-/** 简单语言检测：自动模式下用。基于 Unicode 区段 + 常见特征词 */
 function detectLang(text) {
   const t = text.trim();
   if (!t) return "en";
-  // 日文假名优先于汉字
   if (/[\u3040-\u30ff]/.test(t)) return "ja";
   if (/[\uac00-\ud7af]/.test(t)) return "ko";
   if (/[\u0400-\u04ff]/.test(t)) return "ru";
@@ -209,29 +334,27 @@ function detectLang(text) {
   if (/[\u0e00-\u0e7f]/.test(t)) return "th";
   const cjk = (t.match(/[\u4e00-\u9fff]/g) || []).length;
   const latin = (t.match(/[a-zA-Z]/g) || []).length;
-  // 中英混合：返回 mixed，由支持 auto-detect 的引擎整体处理（不能直通）
   if (cjk > 0 && latin >= 4 && latin / (cjk + latin) > 0.25) return "mixed";
   if (cjk > 0) {
-    // 繁体特征字
     if (/[這個說話們時來對開關門長東車馬鳥語髮後裡見聽覺買賣錢紙書學體點餐廳]/.test(t)) return "zh-TW";
     return "zh-CN";
   }
   if (/[\u00e0-\u00ff]/.test(t)) {
-    // 西欧带音符：粗分法/葡
     if (/[ãõâêôç]/i.test(t)) return "pt";
     return "fr";
   }
   if (/[äöüß]/i.test(t)) return "de";
   if (/[áéíóúñ¿¡]/i.test(t)) return "es";
   return "en";
-}const ENGINES = {
+}
+
+const ENGINES = {
   bing: bingTranslate,
   google: googleTranslate,
   youdao: youdaoTranslate,
-  mymemory: (t, f, to) => myMemoryTranslate(t, f, to, process.env.MYMEMORY_EMAIL),
+  mymemory: myMemoryTranslate,
 };
 
-/* ---------------- 翻译缓存：同样的句子不重复请求 ---------------- */
 const cache = new Map();
 const CACHE_MAX = 800;
 
@@ -239,55 +362,47 @@ function cacheGet(key) {
   const v = cache.get(key);
   if (!v) return null;
   if (Date.now() - v.ts > 30 * 60 * 1000) { cache.delete(key); return null; }
-  cache.delete(key); // LRU 提升
+  cache.delete(key);
   cache.set(key, v);
   return v;
 }
-
 function cacheSet(key, val) {
   cache.set(key, { ...val, ts: Date.now() });
   if (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value);
 }
 
-app.post("/api/translate", async (req, res) => {
+app.post("/api/translate", (req, res) => {
   const { text, from = "auto", to = "zh-CN", engine = "auto" } = req.body || {};
   if (typeof text !== "string" || !text.trim()) {
     return res.status(400).json({ ok: false, error: "text required" });
   }
-
   const clean = text.trim().slice(0, 2000);
   const ck = `${from}|${to}|${clean}`;
 
-  // 缓存命中（同样句子常说，会议场景命中率很高）
   const hit = cacheGet(ck);
   if (hit) return res.json({ ok: true, ...hit, cached: true });
 
-  // 自动模式下先本地检测语言，让不支持 auto 的引擎也能工作
   const resolvedFrom = from === "auto" ? detectLang(clean) : from;
 
-  // 中英混合：不能直通，交给支持 auto-detect 的引擎整体处理
   if (resolvedFrom === "mixed") {
-    try {
-      const r = await bingTranslate(clean, "auto", to);
-      const payload = { text: r.text, engine: r.engine, detected: "mixed" };
-      cacheSet(ck, { ...payload });
-      return res.json({ ok: true, ...payload });
-    } catch (e) {
-      // 降级：按主语言（CJK 居多判中文）再走常规链路
-    }
+    bingTranslate(clean, "auto", to)
+      .then((r) => {
+        const payload = { text: r.text, engine: r.engine, detected: "mixed" };
+        cacheSet(ck, { ...payload });
+        res.json({ ok: true, ...payload });
+      })
+      .catch(() => doTranslate(res, clean, resolvedFrom, to, engine, ck));
+    return;
   }
 
-  // 源语言 == 目标语言：直接返回原文，不浪费请求（中文对中文场景）
   if (resolvedFrom === to) {
-    return res.json({
-      ok: true,
-      text: clean,
-      engine: "passthrough",
-      detected: resolvedFrom,
-      skipped: true,
-    });
+    return res.json({ ok: true, text: clean, engine: "passthrough", detected: resolvedFrom, skipped: true });
   }
 
+  doTranslate(res, clean, resolvedFrom, to, engine, ck);
+});
+
+async function doTranslate(res, clean, resolvedFrom, to, engine, ck) {
   const order =
     engine === "auto"
       ? ["bing", "google", "mymemory", "youdao"]
@@ -300,16 +415,9 @@ app.post("/api/translate", async (req, res) => {
     const fn = ENGINES[name];
     if (!fn) continue;
     try {
-      // bing 支持原生 auto-detect；mixed 时强制用 bing（上面已处理，走到这里说明 bing 挂了）
-      // 其他引擎传本地检测结果；mixed 时降级为按 CJK 判定
-      const srcArg =
-        name === "bing" ? from : resolvedFrom === "mixed" ? "zh-CN" : resolvedFrom;
+      const srcArg = name === "bing" ? "auto" : resolvedFrom === "mixed" ? "zh-CN" : resolvedFrom;
       const r = await fn(clean, srcArg, to);
-      const payload = {
-        text: r.text,
-        engine: r.engine,
-        detected: r.detected || (from === "auto" ? resolvedFrom : undefined),
-      };
+      const payload = { text: r.text, engine: r.engine, detected: r.detected || resolvedFrom };
       cacheSet(ck, { ...payload });
       return res.json({ ok: true, ...payload });
     } catch (e) {
@@ -317,12 +425,11 @@ app.post("/api/translate", async (req, res) => {
     }
   }
   res.status(502).json({ ok: false, error: "all engines failed", detail: errors });
-});
+}
 
-/** 健康检查 */
+/* ---------------------------- 基础 ---------------------------- */
 app.get("/api/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
-/** 前端路由兜底 */
 app.get("*", (_req, res) => res.sendFile(path.join(__dirname, "..", "public", "index.html")));
 
 app.listen(PORT, () => console.log(`LiveTranslate listening on :${PORT}`));
