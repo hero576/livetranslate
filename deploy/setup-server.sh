@@ -8,7 +8,7 @@ set -euo pipefail
 
 APP_USER="www"
 APP_DIR="/opt/livetranslate"
-PORT="${PORT:-3000}"
+PORT="${PORT:-8009}"
 
 log()  { echo -e "\n\033[1;36m==> $*\033[0m\n"; }
 warn() { echo -e "\033[1;33m[警告] $*\033[0m"; }
@@ -87,12 +87,12 @@ ok "systemd 服务已配置（首次部署代码后执行 systemctl start livetr
 log "配置防火墙"
 if command -v ufw >/dev/null 2>&1; then
   ufw allow 22/tcp    > /dev/null 2>&1 || true
-  ufw allow "$PORT"/tcp > /dev/null 2>&1 || true
+  ufw allow 8009/tcp > /dev/null 2>&1 || true
   ufw --force enable   > /dev/null 2>&1 || true
   ok "ufw 已放行 22 和 $PORT"
 elif command -v firewall-cmd >/dev/null 2>&1; then
   firewall-cmd --permanent --add-port=22/tcp   > /dev/null 2>&1 || true
-  firewall-cmd --permanent --add-port="$PORT"/tcp > /dev/null 2>&1 || true
+  firewall-cmd --permanent --add-port=8009/tcp > /dev/null 2>&1 || true
   firewall-cmd --reload > /dev/null 2>&1 || true
   ok "firewalld 已放行"
 else
@@ -112,5 +112,5 @@ echo ""
 echo "下一步："
 echo "  1. 把仓库代码部署到 $APP_DIR/current"
 echo "  2. systemctl start livetranslate"
-echo "  3. curl http://127.0.0.1:$PORT/api/health  验证"
+echo "  3. curl http://127.0.0.1:8009/api/health  验证"
 echo ""

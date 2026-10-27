@@ -68,7 +68,7 @@ jobs:
 
           # 健康检查（最多 15 秒）
           for i in $(seq 1 15); do
-            if curl -fsS "http://127.0.0.1:3000/api/health" > /dev/null 2>&1; then
+            if curl -fsS "http://127.0.0.1:8009/api/health" > /dev/null 2>&1; then
               echo "✅ 部署成功，服务健康检查通过"
               exit 0
             fi
@@ -92,7 +92,7 @@ jobs:
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
 
           result=$(ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
-            "curl -fsS -m 20 -X POST http://127.0.0.1:3000/api/translate \
+            "curl -fsS -m 20 -X POST http://127.0.0.1:8009/api/translate \
              -H 'Content-Type: application/json' \
              -d '{\"text\":\"Hello, this is a deployment test.\",\"from\":\"auto\",\"to\":\"zh-CN\"}'")
           echo "翻译结果: $result"
