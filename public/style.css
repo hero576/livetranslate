@@ -859,3 +859,78 @@ input[type="range"]::-webkit-slider-thumb {
 .account-box h3 { font-size: 13px; margin-bottom: 10px; color: var(--fg); }
 .account-box p { font-size: 12px; color: var(--fg-dim); margin-bottom: 10px; }
 .account-box .primary-btn { margin-top: 4px; }
+
+/* ================= 多端适配增强 ================= */
+html, body { overflow-x: hidden; }
+
+.app {
+  height: 100vh;         /* 旧浏览器回退 */
+  height: 100dvh;
+}
+
+/* 平板（721-1024px）：适度收窄侧栏 */
+@media (min-width: 721px) and (max-width: 1024px) {
+  .sidebar { flex-basis: 200px; }
+}
+
+/* 手机（≤720px） */
+@media (max-width: 720px) {
+  .topbar { padding: 10px 12px 6px; }
+  .logo { width: 34px; height: 34px; font-size: 17px; }
+  .brand h1 { font-size: 15px; }
+  .top-actions { gap: 6px; }
+  .top-actions .icon-btn { width: 34px; height: 34px; }
+
+  .main { flex-direction: column; margin: 0 10px; gap: 8px; }
+
+  /* 会话侧栏 → 横向滚动 chip 条 */
+  .sidebar { flex: 0 0 auto; max-height: none; border-radius: 12px; }
+  .sidebar-head { padding: 8px 10px; }
+  .conv-list { display: flex; flex-direction: row; overflow-x: auto; gap: 6px; padding: 8px; }
+  .conv-item { flex: 0 0 auto; white-space: nowrap; margin-bottom: 0; padding: 7px 12px; border: 1px solid var(--line); }
+  .conv-item.active { border-color: rgba(79,140,255,.4); }
+  .conv-actions { display: none; }
+  .conv-count { display: none; }
+
+  .content .panel { padding: 12px; margin: 0; }
+  .panel .row { gap: 8px; }
+  .field > span { font-size: 10px; white-space: nowrap; }
+  select { font-size: 13px; padding: 9px 26px 9px 10px; }
+
+  .row.secondary { gap: 10px; }
+  .dialect-tip { flex-basis: 100%; font-size: 10.5px; line-height: 1.5; }
+
+  .stage { margin: 0; }
+  .tgt-line { font-size: 16px; padding: 10px 13px; }
+  .src-line { font-size: 12.5px; }
+  .live-text { font-size: 15px; }
+
+  .typebox { margin: 0 0 8px; }
+  .typebox input { padding: 10px 13px; font-size: 15px; }
+  .send-btn { width: 44px; height: 44px; }
+
+  .dock { gap: 10px; padding: 8px 10px calc(10px + env(safe-area-inset-bottom)); }
+  .mic-btn { width: 60px; height: 60px; }
+  .dock-actions { gap: 6px; }
+  .dock-actions .icon-btn { width: 40px; height: 40px; }
+
+  /* 抽屉 / 弹窗 */
+  .drawer { padding: 12px; align-items: flex-end; }
+  .drawer-card { max-height: 88dvh; border-radius: 16px 16px 0 0; padding: 18px 16px; max-width: none; }
+  .drawer-card.wide { max-width: none; }
+
+  .auth-overlay { padding: 14px; }
+  .auth-card { padding: 22px 18px; border-radius: 16px; }
+
+  .stat-grid { grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .stat { padding: 12px 8px; }
+  .stat b { font-size: 19px; }
+}
+
+/* 超窄屏（≤400px）：语言选择上下堆叠 */
+@media (max-width: 400px) {
+  .panel .row { flex-wrap: wrap; }
+  .panel .row .field { flex-basis: 100%; }
+  .stat-grid { grid-template-columns: repeat(2, 1fr); }
+  .brand .tagline { display: none; }
+}
