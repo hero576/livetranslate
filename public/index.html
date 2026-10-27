@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>LiveTranslate · 实时语音翻译</title>
+<meta name="description" content="免费的实时语音翻译工具：自动识别中英文（含口音/方言），边说边译，无时长限制，无需登录。">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌐</text></svg>">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+
+  <!-- ============ 顶栏 ============ -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">🌐</div>
+      <div>
+        <h1>LiveTranslate</h1>
+        <p class="tagline">实时语音翻译 · 不限时长 · 免登录</p>
+      </div>
+    </div>
+    <div class="top-actions">
+      <button id="btnSettings" class="icon-btn" title="设置">⚙️</button>
+      <button id="btnHelp" class="icon-btn" title="帮助">?</button>
+    </div>
+  </header>
+
+  <!-- ============ 控制面板 ============ -->
+  <section class="panel">
+    <div class="row">
+      <label class="field">
+        <span>我听到的语言</span>
+        <select id="selSrc">
+          <option value="auto" selected>自动检测</option>
+          <option value="zh-CN">中文（普通话）</option>
+          <option value="zh-TW">中文（台湾国语）</option>
+          <option value="en">English</option>
+          <option value="ja">日本語</option>
+          <option value="ko">한국어</option>
+          <option value="fr">Français</option>
+          <option value="de">Deutsch</option>
+          <option value="es">Español</option>
+          <option value="ru">Русский</option>
+          <option value="ar">العربية</option>
+          <option value="pt">Português</option>
+          <option value="th">ไทย</option>
+          <option value="vi">Tiếng Việt</option>
+        </select>
+      </label>
+
+      <div class="swap">→</div>
+
+      <label class="field">
+        <span>翻译成</span>
+        <select id="selTgt">
+          <option value="zh-CN">中文（简体）</option>
+          <option value="en">English</option>
+          <option value="zh-TW">中文（繁体）</option>
+          <option value="ja">日本語</option>
+          <option value="ko">한국어</option>
+          <option value="fr">Français</option>
+          <option value="de">Deutsch</option>
+          <option value="es">Español</option>
+          <option value="ru">Русский</option>
+          <option value="ar">العربية</option>
+          <option value="pt">Português</option>
+          <option value="th">ไทย</option>
+          <option value="vi">Tiếng Việt</option>
+        </select>
+      </label>
+
+      <button id="btnSwap" class="ghost-btn" title="交换语言">⇄</button>
+    </div>
+
+    <div class="row secondary">
+      <label class="mini-field">
+        <span>麦克风</span>
+        <select id="selMic"><option>默认设备</option></select>
+      </label>
+      <label class="mini-field">
+        <span>识别模式</span>
+        <select id="selMode">
+          <option value="dictation">实时（边听边出字）</option>
+          <option value="command">整句（说完再出字，更准）</option>
+        </select>
+      </label>
+      <label class="switch">
+        <input type="checkbox" id="chkAuto" checked>
+        <span>自动朗读译文</span>
+      </label>
+      <label class="switch">
+        <input type="checkbox" id="chkDual" checked>
+        <span>显示原文</span>
+      </label>
+    </div>
+  </section>
+
+  <!-- ============ 主舞台 ============ -->
+  <main class="stage">
+    <div id="transcript" class="transcript" aria-live="polite">
+      <div class="empty" id="emptyState">
+        <div class="empty-icon">🎧</div>
+        <h2>点下方按钮开始</h2>
+        <p>浏览器会实时识别语音并翻译。首次使用请允许麦克风权限。<br>
+           支持中英文自动切换，方言口音也能识别。</p>
+      </div>
+    </div>
+
+    <div id="liveArea" class="live-area" hidden>
+      <div class="live-label"><span class="dot"></span><span id="liveLang">正在听…</span></div>
+      <div id="liveText" class="live-text"></div>
+    </div>
+  </main>
+
+  <!-- ============ 底部控制 ============ -->
+  <footer class="dock">
+    <div class="meter" id="meter"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+
+    <button id="btnMic" class="mic-btn" aria-label="开始">
+      <svg viewBox="0 0 24 24" width="30" height="30" fill="currentColor"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3z"/><path d="M17 11a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11z"/></svg>
+    </button>
+
+    <div class="dock-actions">
+      <button id="btnClear" class="icon-btn" title="清空">🗑️</button>
+      <button id="btnExport" class="icon-btn" title="导出 txt">⬇️</button>
+      <button id="btnFull" class="icon-btn" title="大字幕模式">⛶</button>
+    </div>
+
+    <div class="status" id="status">待命</div>
+  </footer>
+</div>
+
+<!-- ============ 设置抽屉 ============ -->
+<div class="drawer" id="drawer" hidden>
+  <div class="drawer-card">
+    <h2>设置</h2>
+
+    <label class="block-field">
+      <span>翻译引擎</span>
+      <select id="selEngine">
+        <option value="auto">自动（推荐，失败自动切换）</option>
+        <option value="google">Google（需能访问）</option>
+        <option value="mymemory">MyMemory（国内可用）</option>
+        <option value="youdao">有道</option>
+      </select>
+    </label>
+
+    <label class="block-field">
+      <span>朗读声音</span>
+      <select id="selVoice"><option value="">默认</option></select>
+    </label>
+
+    <label class="block-field">
+      <span>朗读语速 <b id="rateVal">1.0x</b></span>
+      <input type="range" id="rngRate" min="0.6" max="1.6" step="0.1" value="1.0">
+    </label>
+
+    <label class="block-field">
+      <span>字号 <b id="fontVal">中</b></span>
+      <input type="range" id="rngFont" min="80" max="180" step="10" value="100">
+    </label>
+
+    <div class="tips">
+      <p><b>关于准确率：</b>识别由浏览器自带的语音引擎完成（Chrome 用的是云端引擎，对带口音的英语、普通话及部分方言有较好适应性）。</p>
+      <p><b>关于时长：</b>本工具是直连浏览器语音接口，<b>没有 10 分钟限制</b>。但 Chrome 连续静音约 8 秒会自动结束一次识别，本程序已做自动续接，可长时间使用。</p>
+      <p><b>隐私：</b>语音识别在浏览器/厂商云端完成；文本翻译经由本页面服务端转发，不落库、不记录。</p>
+    </div>
+
+    <button class="primary-btn" id="btnCloseDrawer">完成</button>
+  </div>
+</div>
+
+<!-- ============ 帮助 ============ -->
+<div class="drawer" id="help" hidden>
+  <div class="drawer-card">
+    <h2>使用说明</h2>
+    <ol class="help-list">
+      <li>推荐使用 <b>Chrome / Edge</b> 浏览器（Safari 支持度较差）。</li>
+      <li>点中间大按钮开始，对着麦克风说话即可。</li>
+      <li>听到外语时，"我听到的语言"选自动检测即可。</li>
+      <li>对方说话口音重：改用 <b>整句模式</b>，说完一句再停顿，识别更准。</li>
+      <li>方言：普通话识别对川渝、东北、粤语口音普通话有一定适应性；纯方言建议让对方说普通话或改用文字输入。</li>
+      <li>需要投屏给对面看？点 ⛶ 进入大字幕模式。</li>
+      <li>会议场景：把手机/电脑放在说话人附近，或直接播放对方语音（用麦克风拾音）。</li>
+    </ol>
+    <button class="primary-btn" id="btnCloseHelp">知道了</button>
+  </div>
+</div>
+
+<!-- ============ 全屏字幕 ============ -->
+<div class="cinema" id="cinema" hidden>
+  <div id="cinemaBody"></div>
+  <button id="btnExitCinema" class="exit-cinema">退出大字幕</button>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
