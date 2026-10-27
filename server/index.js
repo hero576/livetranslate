@@ -120,25 +120,33 @@ const BING_LANG_REVERSE = Object.fromEntries(
   Object.entries(BING_LANG).map(([k, v]) => [v, k])
 );
 
-let bingCred = null; // { ig, token, key, ts }
+let bingCred = null; // { ig, token, key, ts, host, cookies }
 
-async function refreshBingCred() {
-  const res = await fetch("https://cn.bing.com/translator", {
+/* 国内 IP 用 cn.bing.com，海外 IP 用 www.bing.com；自动探测切换 */
+const BING_HOSTS = ["www.bing.com", "cn.bing.com"];
+
+async function refreshBingCred(host) {
+  const res = await fetch(`https://${host}/translator`, {
     headers: { "User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8" },
+    redirect: "follow",
     signal: AbortSignal.timeout(6000),
   });
   if (!res.ok) throw new Error("bing page " + res.status);
+  // 海外 IP 必须带 Cookie 才能调用 ttranslatev3
+  const cookies = (res.headers.getSetCookie?.() || [])
+    .map((c) => c.split(";")[0])
+    .join("; ");
   const html = await res.text();
   const ig = (html.match(/IG:"([0-9A-F]+)"/) || [])[1];
   const m = html.match(/params_AbusePreventionHelper\s*=\s*\[(\d+),"([^"]+)"/);
   if (!ig || !m) throw new Error("bing cred parse failed");
-  bingCred = { ig, key: m[1], token: m[2], ts: Date.now() };
+  bingCred = { ig, key: m[1], token: m[2], ts: Date.now(), host, cookies };
   return bingCred;
 }
 
 async function bingTranslate(text, from, to) {
   if (!bingCred || Date.now() - bingCred.ts > 12 * 60 * 1000) {
-    await refreshBingCred();
+    await refreshBingCred(BING_HOSTS[0]);
   }
   const tgt = BING_LANG[to] || to;
   const src = from === "auto" ? "auto-detect" : BING_LANG[from] || from;
@@ -152,16 +160,18 @@ async function bingTranslate(text, from, to) {
       key: bingCred.key,
     });
     const r = await fetch(
-      `https://cn.bing.com/ttranslatev3?isVertical=1&IG=${bingCred.ig}&IID=translator.5023.1`,
+      `https://${bingCred.host}/ttranslatev3?isVertical=1&IG=${bingCred.ig}&IID=translator.5023.1`,
       {
         method: "POST",
         headers: {
           "User-Agent": UA,
-          Referer: "https://cn.bing.com/translator",
-          Origin: "https://cn.bing.com",
+          Referer: `https://${bingCred.host}/translator`,
+          Origin: `https://${bingCred.host}`,
           "Content-Type": "application/x-www-form-urlencoded",
+          ...(bingCred.cookies ? { Cookie: bingCred.cookies } : {}),
         },
         body,
+        redirect: "follow",
         signal: AbortSignal.timeout(7000),
       }
     );
@@ -169,9 +179,11 @@ async function bingTranslate(text, from, to) {
   };
 
   let data = await doPost();
-  // token 过期则刷新重试一次
-  if (data?.statusCode === 400 || data?.ShowCaptcha) {
-    await refreshBingCred();
+  // token 过期或空响应 → 换主机 + 刷新凭据重试
+  if (!data?.[0]?.translations && (data?.statusCode === 400 || data?.ShowCaptcha || data?.length === 0)) {
+    const next =
+      BING_HOSTS[(BING_HOSTS.indexOf(bingCred.host) + 1) % BING_HOSTS.length];
+    await refreshBingCred(next);
     data = await doPost();
   }
   const out = data?.[0]?.translations?.[0]?.text;

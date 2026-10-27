@@ -5,23 +5,18 @@ on:
     branches: [master]
   workflow_dispatch:
 
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
 jobs:
   deploy:
-    name: Deploy to 47.74.211.77
+    name: Deploy to production
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm ci --omit=dev
 
       # ---------- 部署 ----------
       - name: Deploy via SSH
@@ -33,65 +28,73 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 写入私钥
           echo "$DEPLOY_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H $DEPLOY_HOST >> ~/.ssh/known_hosts 2>/dev/null || true
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+          SSH_CMD="ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new $DEPLOY_USER@$DEPLOY_HOST"
 
           # 上传代码（排除 node_modules / .git）
           tar --exclude='node_modules' --exclude='.git' -czf /tmp/release.tar.gz .
           scp -i ~/.ssh/deploy_key /tmp/release.tar.gz \
-              $DEPLOY_USER@$DEPLOY_HOST:/tmp/release.tar.gz
+              "$DEPLOY_USER@$DEPLOY_HOST:/tmp/release.tar.gz"
 
           # 远端：备份 → 解压 → 安装依赖 → 重启服务 → 健康检查
-          ssh -i ~/.ssh/deploy_key $DEPLOY_USER@$DEPLOY_HOST bash -s <<'REMOTE'
+          # 注意：DEPLOY_PATH 通过 env 前缀传给远端 bash（heredoc 用引号包裹不展开本地变量）
+          $SSH_CMD "DEPLOY_PATH='$DEPLOY_PATH' bash -s" <<'REMOTE'
           set -euo pipefail
           APP_DIR="$DEPLOY_PATH"
+          echo "部署目录: $APP_DIR"
 
-          # 备份当前版本
-          if [ -d "$APP_DIR" ] && [ -d "$APP_DIR/current" ]; then
+          # 备份当前版本（保留最近 3 份）
+          if [ -d "$APP_DIR/current" ]; then
             tar -czf "$APP_DIR/backup-$(date +%Y%m%d-%H%M%S).tar.gz" -C "$APP_DIR" current
-            rm -rf "$APP_DIR/current"
+            rm -rf "$APP_DIR/current.new"
             ls -1t "$APP_DIR"/backup-*.tar.gz 2>/dev/null | tail -n +4 | xargs -r rm -f
           fi
 
-          mkdir -p "$APP_DIR/current"
-          tar -xzf /tmp/release.tar.gz -C "$APP_DIR/current"
+          # 原子部署：先解压到 current.new，成功后切换
+          mkdir -p "$APP_DIR/current.new"
+          tar -xzf /tmp/release.tar.gz -C "$APP_DIR/current.new"
           rm -f /tmp/release.tar.gz
 
-          cd "$APP_DIR/current"
-          npm ci --omit=dev --no-audit --no-fund
+          cd "$APP_DIR/current.new"
+          npm ci --omit=dev --no-audit --no-fund 2>&1 | grep -v '^npm notice' || true
 
-          # 切换软链
-          ln -sfn "$APP_DIR/current" "$APP_DIR/live"
+          rm -rf "$APP_DIR/current"
+          mv "$APP_DIR/current.new" "$APP_DIR/current"
 
-          # 重启服务
           systemctl restart livetranslate
-          sleep 2
 
-          # 健康检查
-          for i in $(seq 1 10); do
+          # 健康检查（最多 15 秒）
+          for i in $(seq 1 15); do
             if curl -fsS "http://127.0.0.1:3000/api/health" > /dev/null 2>&1; then
               echo "✅ 部署成功，服务健康检查通过"
-              curl -s "http://127.0.0.1:3000/api/health"; echo
               exit 0
             fi
             sleep 1
           done
-          echo "❌ 健康检查失败"
+          echo "❌ 健康检查失败，服务日志："
           journalctl -u livetranslate -n 40 --no-pager
           exit 1
           REMOTE
 
+      # ---------- 冒烟测试（通过 SSH 在服务器本机执行，不依赖外网端口） ----------
       - name: Smoke test translation API
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           DEPLOY_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
         run: |
           set -euo pipefail
-          result=$(curl -fsS -X POST "http://$DEPLOY_HOST:3000/api/translate" \
-            -H "Content-Type: application/json" \
-            -d '{"text":"Hello, this is a deployment test.","from":"auto","to":"zh-CN"}')
+          echo "$DEPLOY_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+          result=$(ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
+            "curl -fsS -m 20 -X POST http://127.0.0.1:3000/api/translate \
+             -H 'Content-Type: application/json' \
+             -d '{\"text\":\"Hello, this is a deployment test.\",\"from\":\"auto\",\"to\":\"zh-CN\"}'")
           echo "翻译结果: $result"
           echo "$result" | grep -q '"ok":true' || { echo "❌ 翻译接口异常"; exit 1; }
           echo "✅ 翻译接口正常"
