@@ -327,6 +327,44 @@ select:focus, input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px r
   word-break: break-word;
 }
 
+/* ---------------- 手动输入 ---------------- */
+.typebox {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 8px;
+  margin: 0 20px 10px;
+}
+
+.typebox input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 11px 14px;
+  font-size: 14px;
+  font-family: var(--font);
+  color: var(--fg);
+  background: #0e121a;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  outline: none;
+  transition: .18s;
+}
+.typebox input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(79,140,255,.15); }
+.typebox input::placeholder { color: #5c667a; }
+
+.send-btn {
+  flex: 0 0 auto;
+  width: 42px; height: 42px;
+  border-radius: 50%;
+  border: none;
+  display: grid; place-items: center;
+  font-size: 15px;
+  color: #fff;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  cursor: pointer;
+  transition: .18s;
+}
+.send-btn:hover { filter: brightness(1.1); transform: translateY(-1px); }
+
 /* ---------------- 底部 ---------------- */
 .dock {
   flex: 0 0 auto;
@@ -542,6 +580,8 @@ input[type="range"]::-webkit-slider-thumb {
 @media (max-width: 720px) {
   .panel { margin: 0 12px 8px; padding: 12px; }
   .stage { margin: 0 12px; }
+  .typebox { margin: 0 12px 8px; }
+  .typebox input { padding: 9px 12px; font-size: 13px; }
   .row { gap: 7px; }
   .swap { display: none; }
   .field > span { font-size: 10px; }

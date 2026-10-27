@@ -22,6 +22,8 @@ const els = {
   chkAuto: $("chkAuto"),
   chkDual: $("chkDual"),
   btnSwap: $("btnSwap"),
+  txtInput: $("txtInput"),
+  btnSend: $("btnSend"),
   btnMic: $("btnMic"),
   btnClear: $("btnClear"),
   btnExport: $("btnExport"),
@@ -51,7 +53,7 @@ const els = {
 const LANG_NAME = {
   "zh-CN": "中文", "zh-TW": "中文(繁)", en: "English", ja: "日本語", ko: "한국어",
   fr: "Français", de: "Deutsch", es: "Español", ru: "Русский", ar: "العربية",
-  pt: "Português", th: "ไทย", vi: "Tiếng Việt",
+  pt: "Português", th: "ไทย", vi: "Tiếng Việt", mixed: "中英混合",
 };
 
 const BCP47 = {
@@ -310,7 +312,9 @@ async function doTranslate(text) {
     // 自动检测到语言后，更新气泡标签（让用户知道系统识别成了什么语言）
     if (data.detected && node.badge) {
       const fromLabel = LANG_NAME[data.detected] || data.detected;
-      node.badge.textContent = `${fromLabel} → ${LANG_NAME[tgtLang] || tgtLang}`;
+      node.badge.textContent = data.skipped
+        ? `${fromLabel}（已是目标语言，无需翻译）`
+        : `${fromLabel} → ${LANG_NAME[tgtLang] || tgtLang}`;
       if (data.detected !== els.selTgt.value) {
         node.badge.title = `识别为 ${fromLabel}（引擎 ${data.engine}）`;
       }
@@ -553,6 +557,24 @@ function stopListening(hard = false) {
 els.btnMic.addEventListener("click", () => {
   if (state.listening) stopListening();
   else startListening();
+});
+
+/* 手动输入：方言说不准时直接打字翻译 */
+function submitTyped() {
+  const text = els.txtInput.value.trim();
+  if (!text) return;
+  els.txtInput.value = "";
+  if (els.emptyState) els.emptyState.style.display = "none";
+  state.started = true;
+  enqueueTranslate(text);
+}
+
+els.btnSend.addEventListener("click", submitTyped);
+els.txtInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.isComposing) {
+    e.preventDefault();
+    submitTyped();
+  }
 });
 
 els.btnSwap.addEventListener("click", () => {

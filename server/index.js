@@ -196,6 +196,9 @@ function detectLang(text) {
   if (/[\u0600-\u06ff]/.test(t)) return "ar";
   if (/[\u0e00-\u0e7f]/.test(t)) return "th";
   const cjk = (t.match(/[\u4e00-\u9fff]/g) || []).length;
+  const latin = (t.match(/[a-zA-Z]/g) || []).length;
+  // 中英混合：返回 mixed，由支持 auto-detect 的引擎整体处理（不能直通）
+  if (cjk > 0 && latin >= 4 && latin / (cjk + latin) > 0.25) return "mixed";
   if (cjk > 0) {
     // 繁体特征字
     if (/[這個說話們時來對開關門長東車馬鳥語髮後裡見聽覺買賣錢紙書學體點餐廳]/.test(t)) return "zh-TW";
@@ -208,11 +211,8 @@ function detectLang(text) {
   }
   if (/[äöüß]/i.test(t)) return "de";
   if (/[áéíóúñ¿¡]/i.test(t)) return "es";
-  const latin = (t.match(/[a-zA-Z]/g) || []).length;
-  return latin > 0 ? "en" : "en";
-}
-
-const ENGINES = {
+  return "en";
+}const ENGINES = {
   bing: bingTranslate,
   google: googleTranslate,
   youdao: youdaoTranslate,
@@ -253,6 +253,29 @@ app.post("/api/translate", async (req, res) => {
   // 自动模式下先本地检测语言，让不支持 auto 的引擎也能工作
   const resolvedFrom = from === "auto" ? detectLang(clean) : from;
 
+  // 中英混合：不能直通，交给支持 auto-detect 的引擎整体处理
+  if (resolvedFrom === "mixed") {
+    try {
+      const r = await bingTranslate(clean, "auto", to);
+      const payload = { text: r.text, engine: r.engine, detected: "mixed" };
+      cacheSet(ck, { ...payload });
+      return res.json({ ok: true, ...payload });
+    } catch (e) {
+      // 降级：按主语言（CJK 居多判中文）再走常规链路
+    }
+  }
+
+  // 源语言 == 目标语言：直接返回原文，不浪费请求（中文对中文场景）
+  if (resolvedFrom === to) {
+    return res.json({
+      ok: true,
+      text: clean,
+      engine: "passthrough",
+      detected: resolvedFrom,
+      skipped: true,
+    });
+  }
+
   const order =
     engine === "auto"
       ? ["bing", "google", "mymemory", "youdao"]
@@ -265,8 +288,10 @@ app.post("/api/translate", async (req, res) => {
     const fn = ENGINES[name];
     if (!fn) continue;
     try {
-      // bing 支持原生 auto-detect，其他引擎传本地检测结果
-      const srcArg = name === "bing" ? from : resolvedFrom;
+      // bing 支持原生 auto-detect；mixed 时强制用 bing（上面已处理，走到这里说明 bing 挂了）
+      // 其他引擎传本地检测结果；mixed 时降级为按 CJK 判定
+      const srcArg =
+        name === "bing" ? from : resolvedFrom === "mixed" ? "zh-CN" : resolvedFrom;
       const r = await fn(clean, srcArg, to);
       const payload = {
         text: r.text,
