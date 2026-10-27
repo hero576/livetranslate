@@ -1,0 +1,97 @@
+name: Deploy to Server
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy to 47.74.211.77
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci --omit=dev
+
+      # ---------- 部署 ----------
+      - name: Deploy via SSH
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          set -euo pipefail
+
+          # 写入私钥
+          echo "$DEPLOY_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H $DEPLOY_HOST >> ~/.ssh/known_hosts 2>/dev/null || true
+
+          # 上传代码（排除 node_modules / .git）
+          tar --exclude='node_modules' --exclude='.git' -czf /tmp/release.tar.gz .
+          scp -i ~/.ssh/deploy_key /tmp/release.tar.gz \
+              $DEPLOY_USER@$DEPLOY_HOST:/tmp/release.tar.gz
+
+          # 远端：备份 → 解压 → 安装依赖 → 重启服务 → 健康检查
+          ssh -i ~/.ssh/deploy_key $DEPLOY_USER@$DEPLOY_HOST bash -s <<'REMOTE'
+          set -euo pipefail
+          APP_DIR="$DEPLOY_PATH"
+
+          # 备份当前版本
+          if [ -d "$APP_DIR" ] && [ -d "$APP_DIR/current" ]; then
+            tar -czf "$APP_DIR/backup-$(date +%Y%m%d-%H%M%S).tar.gz" -C "$APP_DIR" current
+            rm -rf "$APP_DIR/current"
+            ls -1t "$APP_DIR"/backup-*.tar.gz 2>/dev/null | tail -n +4 | xargs -r rm -f
+          fi
+
+          mkdir -p "$APP_DIR/current"
+          tar -xzf /tmp/release.tar.gz -C "$APP_DIR/current"
+          rm -f /tmp/release.tar.gz
+
+          cd "$APP_DIR/current"
+          npm ci --omit=dev --no-audit --no-fund
+
+          # 切换软链
+          ln -sfn "$APP_DIR/current" "$APP_DIR/live"
+
+          # 重启服务
+          systemctl restart livetranslate
+          sleep 2
+
+          # 健康检查
+          for i in $(seq 1 10); do
+            if curl -fsS "http://127.0.0.1:3000/api/health" > /dev/null 2>&1; then
+              echo "✅ 部署成功，服务健康检查通过"
+              curl -s "http://127.0.0.1:3000/api/health"; echo
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "❌ 健康检查失败"
+          journalctl -u livetranslate -n 40 --no-pager
+          exit 1
+          REMOTE
+
+      - name: Smoke test translation API
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          result=$(curl -fsS -X POST "http://$DEPLOY_HOST:3000/api/translate" \
+            -H "Content-Type: application/json" \
+            -d '{"text":"Hello, this is a deployment test.","from":"auto","to":"zh-CN"}')
+          echo "翻译结果: $result"
+          echo "$result" | grep -q '"ok":true' || { echo "❌ 翻译接口异常"; exit 1; }
+          echo "✅ 翻译接口正常"
