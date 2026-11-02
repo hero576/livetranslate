@@ -51,8 +51,7 @@ const state = {
   manualStop: false,
   recognition: null,
   restartTimer: null,
-  finalBuffer: "",
-  flushTimer: null,
+  pauseTimer: null,
   translating: 0,
   queue: Promise.resolve(),
   voices: [],
@@ -300,14 +299,25 @@ function buildRecognition() {
       els.liveText.textContent = interim.slice(state.interimCommitted);
       els.liveLang.textContent = "正在听…";
       els.emptyState.style.display = "none";
-      // 断句优化：interim 过长或遇到句末标点时，提前把已完整的一部分提交出去，避免长句卡死丢内容
-      commitInterimChunk(interim);
+      // 「实时」模式：边听边出——长句提前切分 + 停顿自动提交；
+      // 「整句」模式：interim 只显示，等 final 定稿后再翻译（更准）。
+      if (els.selMode.value === "dictation") {
+        commitInterimChunk(interim);
+        armPauseCommit();
+      }
     }
     if (finalized) {
+      clearTimeout(state.pauseTimer);
+      // 已通过 interim 提前提交过的前缀，从 final 里剥离，避免重复翻译
+      let remain = finalized;
+      if (state.interimCommitted > 0 && state.lastInterim &&
+          finalized.startsWith(state.lastInterim.slice(0, state.interimCommitted))) {
+        remain = finalized.slice(state.interimCommitted).trim();
+      }
+      if (remain) handleFinal(remain);
       state.lastInterim = "";
       state.interimCommitted = 0;
       els.liveText.textContent = "";
-      handleFinal(finalized);
     }
   };
 
@@ -330,7 +340,6 @@ function buildRecognition() {
     if (state.manualStop) {
       state.listening = false;
       els.liveArea.hidden = true;
-      flushBuffer(true);
       renderMic(false);
       setStatus("已停止");
       return;
@@ -383,31 +392,48 @@ function commitInterimChunk(interim) {
   }
 }
 
+/* 停顿自动提交：说话者短暂停顿时（无新识别结果），把已累积的 interim 提交。
+   解决「整句说完但没有标点、Chrome 迟迟不给 final」导致的内容卡住。 */
+function armPauseCommit() {
+  clearTimeout(state.pauseTimer);
+  state.pauseTimer = setTimeout(commitPause, 700);
+}
+
+function commitPause() {
+  const full = state.lastInterim || "";
+  const rest = full.slice(state.interimCommitted).trim();
+  if (rest.length >= 2) {
+    handleFinal(rest);
+    state.interimCommitted = full.length; // 标记已提交，final 到来时剥离，避免重复
+    els.liveText.textContent = "";
+  }
+}
+
 /* 把当前还没提交的 interim 尾巴也送出去 */
 function flushInterim() {
+  clearTimeout(state.pauseTimer);
   const rest = (state.lastInterim || "").slice(state.interimCommitted).trim();
   state.lastInterim = "";
   state.interimCommitted = 0;
   if (rest.length >= 2) handleFinal(rest);
 }
 
+/* 句末没有标点时自动补上，让译文更整齐、也便于按标点断句 */
+function ensurePunct(text) {
+  if (!text) return text;
+  if (/[。！？!?；;…：:,，]$/.test(text)) return text;
+  return /[\u4e00-\u9fff]/.test(text) ? text + "。" : text + ".";
+}
+
 function handleFinal(text) {
   state.started = true;
   els.emptyState.style.display = "none";
-  state.finalBuffer = (state.finalBuffer + " " + text).replace(/\s+/g, " ").trim();
-  const wait = els.selMode.value === "command" ? 1200 : 520;
-  clearTimeout(state.flushTimer);
-  state.flushTimer = setTimeout(() => flushBuffer(), wait);
+  text = (text || "").trim();
+  if (!text) return;
+  text = ensurePunct(text);
+  // 定稿即翻译，不再进缓冲等待，避免内容卡在缓冲里迟迟不出现
+  splitChunks(text).forEach((c) => enqueueTranslate(c, true));
   setStatus("识别中…");
-}
-
-function flushBuffer(force = false) {
-  clearTimeout(state.flushTimer);
-  const buf = state.finalBuffer.trim();
-  if (!buf) return;
-  if (!force && buf.length < 6) { state.flushTimer = setTimeout(() => flushBuffer(), 900); return; }
-  state.finalBuffer = "";
-  splitChunks(buf).forEach((c) => enqueueTranslate(c, true));
 }
 
 function splitChunks(text) {
@@ -699,7 +725,6 @@ function stopListening(hard = false) {
   flushInterim(); // 手动停止也把 interim 尾巴送出去
   if (state.recognition) { try { state.recognition.stop(); } catch { /* ignore */ } }
   renderMic(false);
-  flushBuffer(true);
   els.liveArea.hidden = true;
   setStatus("已停止");
 }
