@@ -31,9 +31,18 @@ async function init() {
       role VARCHAR(16) NOT NULL DEFAULT 'user',
       status VARCHAR(16) NOT NULL DEFAULT 'pending',
       created_at BIGINT NOT NULL,
-      last_login_at BIGINT NULL
+      last_login_at BIGINT NULL,
+      must_change_pwd TINYINT(1) NOT NULL DEFAULT 0
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
   `);
+  // 兼容旧表：补充 must_change_pwd 列（MariaDB 支持 IF NOT EXISTS，MySQL 降级为普通 ALTER 并忽略“已存在”错误）
+  try {
+    await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_pwd TINYINT(1) NOT NULL DEFAULT 0");
+  } catch {
+    try {
+      await pool.query("ALTER TABLE users ADD COLUMN must_change_pwd TINYINT(1) NOT NULL DEFAULT 0");
+    } catch { /* 列已存在 */ }
+  }
   await pool.query(`
     CREATE TABLE IF NOT EXISTS conversations (
       id VARCHAR(16) PRIMARY KEY,
@@ -86,6 +95,7 @@ function rowToUser(r) {
     status: r.status,
     createdAt: Number(r.created_at),
     lastLoginAt: r.last_login_at == null ? null : Number(r.last_login_at),
+    mustChangePwd: Number(r.must_change_pwd) === 1,
   };
 }
 
@@ -94,20 +104,21 @@ function verifyPassword(user, password) {
   return crypto.timingSafeEqual(Buffer.from(h, "hex"), Buffer.from(user.passHash, "hex"));
 }
 
-async function createUser(username, password) {
+async function createUser(username, password, opts = {}) {
   const salt = crypto.randomBytes(16).toString("hex");
   const user = {
     id: uid(),
     username: String(username).trim(),
     passHash: hashPassword(password, salt),
     salt,
-    role: "user",
-    status: "pending",
+    role: opts.role || "user",
+    status: opts.status || "pending",
+    mustChangePwd: !!opts.mustChangePwd,
     createdAt: now(),
   };
   await pool.query(
-    "INSERT INTO users (id, username, pass_hash, salt, role, status, created_at) VALUES (?,?,?,?,?,?,?)",
-    [user.id, user.username, user.passHash, user.salt, user.role, user.status, user.createdAt]
+    "INSERT INTO users (id, username, pass_hash, salt, role, status, created_at, must_change_pwd) VALUES (?,?,?,?,?,?,?,?)",
+    [user.id, user.username, user.passHash, user.salt, user.role, user.status, user.createdAt, user.mustChangePwd ? 1 : 0]
   );
   return user;
 }
@@ -138,7 +149,16 @@ async function touchLogin(id) {
 async function updatePassword(id, newPassword) {
   const salt = crypto.randomBytes(16).toString("hex");
   const passHash = hashPassword(newPassword, salt);
-  await pool.query("UPDATE users SET pass_hash = ?, salt = ? WHERE id = ?", [passHash, salt, id]);
+  await pool.query(
+    "UPDATE users SET pass_hash = ?, salt = ?, must_change_pwd = 0 WHERE id = ?",
+    [passHash, salt, id]
+  );
+  return true;
+}
+
+/* 迁移/安全用途：强制某用户下次登录修改密码 */
+async function flagMustChangePassword(id) {
+  await pool.query("UPDATE users SET must_change_pwd = 1 WHERE id = ?", [id]);
   return true;
 }
 
@@ -309,6 +329,7 @@ export {
   setUserStatus,
   touchLogin,
   updatePassword,
+  flagMustChangePassword,
   listConversations,
   getConversation,
   createConversation,

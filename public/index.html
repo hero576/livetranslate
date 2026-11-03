@@ -38,6 +38,29 @@
   </div>
 </div>
 
+<!-- ============ 强制修改初始密码 ============ -->
+<div class="auth-overlay" id="pwdOverlay" hidden>
+  <div class="auth-card">
+    <div class="auth-brand">
+      <div class="logo">🔒</div>
+      <h1>修改初始密码</h1>
+      <p>为安全起见，首次登录需设置新密码后才能继续使用</p>
+    </div>
+    <form id="pwdForm" autocomplete="off">
+      <label class="block-field">
+        <span>新密码</span>
+        <input type="password" id="pwdNew1" placeholder="至少 6 位" autocomplete="new-password" required>
+      </label>
+      <label class="block-field">
+        <span>确认新密码</span>
+        <input type="password" id="pwdNew2" placeholder="再次输入" autocomplete="new-password" required>
+      </label>
+      <div class="auth-msg" id="pwdMsg"></div>
+      <button type="submit" class="primary-btn" id="pwdSubmit">保存并继续</button>
+    </form>
+  </div>
+</div>
+
 <!-- ============ 主应用 ============ -->
 <div class="app" id="app" hidden>
 

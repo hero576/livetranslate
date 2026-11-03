@@ -23,6 +23,8 @@ const els = {
   authOverlay: $("authOverlay"), authForm: $("authForm"), authUser: $("authUser"),
   authPass: $("authPass"), authMsg: $("authMsg"), authSubmit: $("authSubmit"),
   authHint: $("authHint"), tabLogin: $("tabLogin"), tabRegister: $("tabRegister"),
+  pwdOverlay: $("pwdOverlay"), pwdForm: $("pwdForm"), pwdNew1: $("pwdNew1"),
+  pwdNew2: $("pwdNew2"), pwdMsg: $("pwdMsg"), pwdSubmit: $("pwdSubmit"),
   app: $("app"), btnAdmin: $("btnAdmin"), btnSettings: $("btnSettings"), btnHelp: $("btnHelp"),
   btnLogout: $("btnLogout"), userAvatar: $("userAvatar"), userName: $("userName"),
   sidebar: $("sidebar"), convList: $("convList"), btnNewConv: $("btnNewConv"),
@@ -103,7 +105,8 @@ els.authForm.onsubmit = async (e) => {
       state.token = d.token;
       localStorage.setItem("lt.token", d.token);
       state.user = d.user;
-      enterApp();
+      if (d.mustChangePassword) showForcePwd();
+      else enterApp();
     } else {
       const d = await api("/api/auth/register", { method: "POST", body: JSON.stringify({ username, password }) });
       els.authMsg.textContent = "✅ " + (d.message || "注册成功") + "，请等待管理员审批后登录。";
@@ -131,7 +134,8 @@ async function initAuth() {
   try {
     const d = await api("/api/auth/me");
     state.user = d.user;
-    enterApp();
+    if (d.mustChangePassword) showForcePwd();
+    else enterApp();
   } catch {
     showAuth();
   }
@@ -140,8 +144,37 @@ async function initAuth() {
 function showAuth() {
   els.app.hidden = true;
   els.authOverlay.hidden = false;
+  els.pwdOverlay.hidden = true;
   setAuthMode("login");
 }
+
+/* 强制修改初始密码：登录后若标记了 mustChangePassword 则弹出 */
+function showForcePwd() {
+  els.authOverlay.hidden = true;
+  els.app.hidden = true;
+  els.pwdOverlay.hidden = false;
+  els.pwdNew1.value = els.pwdNew2.value = "";
+  els.pwdMsg.textContent = "";
+}
+
+els.pwdForm.onsubmit = async (e) => {
+  e.preventDefault();
+  const next = els.pwdNew1.value, next2 = els.pwdNew2.value;
+  if (!next || next.length < 6) { els.pwdMsg.textContent = "⚠️ 新密码至少 6 位"; return; }
+  if (next !== next2) { els.pwdMsg.textContent = "⚠️ 两次输入的新密码不一致"; return; }
+  els.pwdSubmit.disabled = true;
+  els.pwdMsg.textContent = "保存中…";
+  try {
+    await api("/api/auth/password", { method: "POST", body: JSON.stringify({ next }) });
+    els.pwdOverlay.hidden = true;
+    els.pwdNew1.value = els.pwdNew2.value = "";
+    enterApp();
+  } catch (err) {
+    els.pwdMsg.textContent = "⚠️ " + err.message;
+  } finally {
+    els.pwdSubmit.disabled = false;
+  }
+};
 
 function enterApp() {
   els.authOverlay.hidden = true;

@@ -12,7 +12,7 @@ app.use(express.json({ limit: "512kb" }));
 app.use(express.static(path.join(__dirname, "..", "public")));
 
 await store.init();
-await seedAdmin();
+await seedAdminFromEnv();
 
 /* ------------------------------------------------------------------ *
  * 认证（内存会话 token，7 天有效；数据落库）
@@ -20,12 +20,31 @@ await seedAdmin();
 const SESSIONS = new Map();
 const SESSION_TTL = 7 * 24 * 3600 * 1000;
 
-async function seedAdmin() {
-  if (!(await store.getUserByUsername("hero576"))) {
-    const u = await store.createUser("hero576", "guoming");
-    await store.pool.query("UPDATE users SET role='admin', status='active' WHERE id=?", [u.id]);
-    console.log("[auth] 已创建初始管理员 hero576");
+/**
+ * 初始管理员不再写死在代码里，改为从环境变量读取：
+ *   ADMIN_USERNAME / ADMIN_PASSWORD
+ * 仅在「该用户名不存在」时创建一次；已存在则幂等地确保其为 admin/active。
+ * 未配置环境变量时不自动创建，改用 `node server/create-admin.js` 手动初始化。
+ */
+async function seedAdminFromEnv() {
+  const username = (process.env.ADMIN_USERNAME || "").trim();
+  const password = process.env.ADMIN_PASSWORD || "";
+  if (!username || !password) {
+    console.log("[auth] 未配置 ADMIN_USERNAME/ADMIN_PASSWORD，跳过自动创建管理员。");
+    console.log("[auth] 如需创建管理员：node server/create-admin.js <用户名> <密码>");
+    return;
   }
+  const existing = await store.getUserByUsername(username);
+  if (existing) {
+    await store.pool.query("UPDATE users SET role='admin', status='active' WHERE id=?", [existing.id]);
+    return;
+  }
+  if (String(password).length < 8) {
+    console.error("[auth] ADMIN_PASSWORD 至少 8 位，已跳过创建管理员。");
+    return;
+  }
+  const u = await store.createUser(username, password, { role: "admin", status: "active", mustChangePwd: true });
+  console.log(`[auth] 已创建初始管理员 ${username}（首次登录需修改密码）`);
 }
 
 function tokenOf(req) {
@@ -47,6 +66,10 @@ async function requireAuth(req, res, next) {
   const u = await currentUser(req);
   if (!u) return res.status(401).json({ ok: false, error: "未登录" });
   if (u.status !== "active") return res.status(403).json({ ok: false, error: "账号待审批或被禁用" });
+  // 强制改密：未改密码前仅允许改密、查看自身、登出
+  if (u.mustChangePwd && !["/api/auth/password", "/api/auth/me"].includes(req.path)) {
+    return res.status(403).json({ ok: false, error: "请先修改初始密码" });
+  }
   req.user = u;
   next();
 }
@@ -75,7 +98,7 @@ app.post("/api/auth/login", async (req, res) => {
   const token = crypto.randomBytes(24).toString("hex");
   SESSIONS.set(token, { userId: u.id, expires: Date.now() + SESSION_TTL });
   await store.touchLogin(u.id);
-  return res.json({ ok: true, token, user: publicUser(u) });
+  return res.json({ ok: true, token, user: publicUser(u), mustChangePassword: !!u.mustChangePwd });
 });
 
 app.post("/api/auth/register", async (req, res) => {
@@ -98,16 +121,20 @@ app.post("/api/auth/logout", (req, res) => {
 });
 
 app.get("/api/auth/me", requireAuth, (req, res) => {
-  res.json({ ok: true, user: publicUser(req.user) });
+  res.json({ ok: true, user: publicUser(req.user), mustChangePassword: !!req.user.mustChangePwd });
 });
 
 /** 修改密码 */
 app.post("/api/auth/password", requireAuth, async (req, res) => {
   const { current, next } = req.body || {};
-  if (!current || !next) return res.status(400).json({ ok: false, error: "请输入当前密码和新密码" });
+  if (!next) return res.status(400).json({ ok: false, error: "请输入新密码" });
   if (String(next).length < 6) return res.status(400).json({ ok: false, error: "新密码至少 6 位" });
-  if (!store.verifyPassword(req.user, current)) {
-    return res.status(400).json({ ok: false, error: "当前密码错误" });
+  // 首次登录强制改密场景：允许省略当前密码（已持有有效 token）
+  if (!req.user.mustChangePwd) {
+    if (!current) return res.status(400).json({ ok: false, error: "请输入当前密码" });
+    if (!store.verifyPassword(req.user, current)) {
+      return res.status(400).json({ ok: false, error: "当前密码错误" });
+    }
   }
   await store.updatePassword(req.user.id, next);
   res.json({ ok: true, message: "密码已更新" });

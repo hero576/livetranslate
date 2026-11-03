@@ -26,6 +26,24 @@ npm start
 
 建议使用 **Chrome / Edge** 浏览器（Safari、Firefox 不支持语音识别）。
 
+## 🔐 管理员初始化
+
+初始管理员**不写死在代码里**，通过环境变量或一次性命令创建（首次登录会强制修改密码）：
+
+```bash
+# 方式一：环境变量（推荐，适合 systemd 等部署）
+ADMIN_USERNAME=admin ADMIN_PASSWORD='你的强密码' npm start
+
+# 方式二：一次性命令（密码也可用 ADMIN_PASSWORD 环境变量传入，避免进入 shell 历史）
+npm run create-admin -- <用户名> <密码>
+```
+
+强制某用户下次登录改密（例如迁移旧默认账号）：
+
+```bash
+npm run create-admin -- --must-change <用户名>
+```
+
 ## 🏗 架构
 
 ```
