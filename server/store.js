@@ -58,8 +58,8 @@ async function init() {
       id VARCHAR(16) PRIMARY KEY,
       conv_id VARCHAR(16) NOT NULL,
       user_id VARCHAR(16) NOT NULL,
-      src TEXT NOT NULL,
-      tgt TEXT NOT NULL,
+      src MEDIUMTEXT NOT NULL,
+      tgt MEDIUMTEXT NOT NULL,
       from_lang VARCHAR(32) NULL,
       to_lang VARCHAR(32) NULL,
       engine VARCHAR(32) NULL,
@@ -68,6 +68,8 @@ async function init() {
       INDEX idx_msg_user (user_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
   `);
+  // 消息长度上限提升到 20000 字：TEXT(64KB) 不够，升级为 MEDIUMTEXT（幂等，可重复执行）
+  await pool.query("ALTER TABLE messages MODIFY src MEDIUMTEXT NOT NULL, MODIFY tgt MEDIUMTEXT NOT NULL");
 }
 
 /* ---------------------------- 用户 ---------------------------- */

@@ -180,8 +180,8 @@ app.post("/api/conv/:id/messages", requireAuth, async (req, res) => {
       await store.addMessage({
         convId: c.id,
         userId: req.user.id,
-        src: it.src.slice(0, 2000),
-        tgt: it.tgt.slice(0, 4000),
+        src: it.src.slice(0, 20000),
+        tgt: it.tgt.slice(0, 20000),
         fromLang: it.fromLang || null,
         toLang: it.toLang || null,
         engine: it.engine || null,
@@ -200,8 +200,8 @@ app.patch("/api/conv/:id/messages/:msgId", requireAuth, async (req, res) => {
     return res.status(400).json({ ok: false, error: "src/tgt required" });
   }
   const ok = await store.updateMessage(req.params.msgId, req.user.id, {
-    src: src.slice(0, 2000),
-    tgt: tgt.slice(0, 4000),
+    src: src.slice(0, 20000),
+    tgt: tgt.slice(0, 20000),
     fromLang: fromLang || null,
     toLang: toLang || null,
     engine: engine || null,
@@ -434,7 +434,7 @@ app.post("/api/translate", (req, res) => {
   if (typeof text !== "string" || !text.trim()) {
     return res.status(400).json({ ok: false, error: "text required" });
   }
-  const clean = text.trim().slice(0, 2000);
+  const clean = text.trim().slice(0, 20000);
   const ck = `${from}|${to}|${clean}`;
 
   const hit = cacheGet(ck);

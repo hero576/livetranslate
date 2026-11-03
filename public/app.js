@@ -836,7 +836,8 @@ function submitTyped() {
   autosizeInput();
   els.emptyState.style.display = "none";
   state.started = true;
-  enqueueTranslate(text, false);
+  // 长文本也按标点智能分段（同语音路径），避免超长文本超出翻译引擎单次上限
+  splitChunks(text).forEach((c) => enqueueTranslate(c, false));
 }
 els.btnSend.onclick = submitTyped;
 els.txtInput.onkeydown = (e) => {

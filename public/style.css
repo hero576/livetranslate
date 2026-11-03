@@ -348,7 +348,7 @@ select:focus, input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px r
   line-height: 1.5;
   font-family: var(--font);
   color: var(--fg);
-  background: #0e121a;
+  background: var(--card);
   border: 1px solid var(--line);
   border-radius: 14px;
   outline: none;
