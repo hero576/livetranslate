@@ -528,8 +528,10 @@ async function doTranslate(text, isSpeech) {
 }
 
 function updateBusy() {
-  if (state.translating > 0) setStatus(`翻译中 ${state.translating}…`);
-  else if (state.listening) setStatus("识别中…");
+  if (state.translating > 0) {
+    // 积压提醒：说话快于翻译时给出明确状态，而不是无限排队无感知
+    setStatus(state.translating >= 4 ? `翻译积压 ${state.translating} 条，稍等…` : `翻译中 ${state.translating}…`);
+  } else if (state.listening) setStatus("识别中…");
 }
 
 /* ---------------------------- 渲染 ---------------------------- */
@@ -721,15 +723,35 @@ function pickVoice(lang) {
   }
   return voiceList.find((v) => v.lang.replace("_", "-").toLowerCase() === String(bcp).toLowerCase()) || null;
 }
+/* 朗读播放队列：顺序播放互不打断；积压时丢弃最旧的待播（字幕/记录仍完整），
+   避免「前一句没读完、后一句插进来，越听越乱」 */
+const tts = { queue: [], playing: false };
+
 function speak(text, lang) {
   if (!("speechSynthesis" in window)) return;
-  speechSynthesis.cancel();
-  const u = new SpeechSynthesisUtterance(text);
-  u.lang = BCP47[lang] || lang;
-  const v = pickVoice(lang);
+  tts.queue.push({ text, lang });
+  if (tts.queue.length > 2) tts.queue.shift(); // 只保留最新的待播 2 条
+  playTts();
+}
+
+function playTts() {
+  if (tts.playing) return;
+  const item = tts.queue.shift();
+  if (!item) return;
+  tts.playing = true;
+  const u = new SpeechSynthesisUtterance(item.text);
+  u.lang = BCP47[item.lang] || item.lang;
+  const v = pickVoice(item.lang);
   if (v) u.voice = v;
   u.rate = Number(els.rngRate.value) || 1;
+  u.onend = u.onerror = () => { tts.playing = false; playTts(); };
   speechSynthesis.speak(u);
+}
+
+function stopTts() {
+  tts.queue = [];
+  tts.playing = false;
+  speechSynthesis.cancel();
 }
 
 /* ---------------------------- 开始/停止 ---------------------------- */
@@ -757,6 +779,7 @@ function stopListening(hard = false) {
   clearTimeout(state.restartTimer);
   flushInterim(); // 手动停止也把 interim 尾巴送出去
   if (state.recognition) { try { state.recognition.stop(); } catch { /* ignore */ } }
+  stopTts(); // 手动停止时同步中断朗读并清空待播队列
   renderMic(false);
   els.liveArea.hidden = true;
   setStatus("已停止");
