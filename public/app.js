@@ -307,6 +307,28 @@ async function syncMessage(m) {
 }
 
 /* ---------------------------- 语音识别 ---------------------------- */
+/* ASR 延迟埋点：评估浏览器识别的上限（决定是否值得接入流式 ASR 引擎时看数据）
+   - first   首字延迟：每次会话(重)启后，到第一个有效结果的时间
+   - confirm 停顿确认延迟：final 定稿与上一个识别事件的间隔（端点检测+网络的和）
+   - recover 恢复延迟：onend 到自动重启成功的间隔
+   控制台输入 asrReport() 查看均值与样本数。 */
+const asrMetrics = { first: [], confirm: [], recover: [], _sessStart: 0, _firstSeen: false, _lastResultAt: 0, _endAt: 0 };
+function asrPush(arr, ms) {
+  if (!Number.isFinite(ms) || ms < 0) return;
+  arr.push(Math.round(ms));
+  if (arr.length > 50) arr.shift();
+}
+window.asrReport = function () {
+  const avg = (a) => (a.length ? Math.round(a.reduce((s, x) => s + x, 0) / a.length) : null);
+  const report = {
+    首字延迟ms: { avg: avg(asrMetrics.first), n: asrMetrics.first.length },
+    停顿确认ms: { avg: avg(asrMetrics.confirm), n: asrMetrics.confirm.length },
+    恢复延迟ms: { avg: avg(asrMetrics.recover), n: asrMetrics.recover.length },
+  };
+  console.table(report);
+  return JSON.stringify(report);
+};
+
 function buildRecognition() {
   if (!SpeechRecognition) return null;
   const rec = new SpeechRecognition();
@@ -315,9 +337,22 @@ function buildRecognition() {
   rec.lang = recognitionLang();
   rec.maxAlternatives = 1;
 
-  rec.onstart = () => setStatus("识别中…");
+  rec.onstart = () => {
+    asrMetrics._sessStart = performance.now();
+    asrMetrics._firstSeen = false;
+    if (asrMetrics._endAt) {
+      asrPush(asrMetrics.recover, performance.now() - asrMetrics._endAt);
+      asrMetrics._endAt = 0;
+    }
+    setStatus("识别中…");
+  };
 
   rec.onresult = (event) => {
+    const nowTs = performance.now();
+    if (!asrMetrics._firstSeen && asrMetrics._sessStart) {
+      asrMetrics._firstSeen = true;
+      asrPush(asrMetrics.first, nowTs - asrMetrics._sessStart);
+    }
     let interim = "", finalized = "";
     for (let i = event.resultIndex; i < event.results.length; i++) {
       const r = event.results[i];
@@ -326,6 +361,11 @@ function buildRecognition() {
       if (r.isFinal) finalized += (finalized ? " " : "") + txt;
       else interim += (interim ? " " : "") + txt;
     }
+    if (finalized) {
+      // 停顿确认延迟：final 与上一个识别事件的间隔（浏览器端点检测耗时）
+      asrPush(asrMetrics.confirm, nowTs - (asrMetrics._lastResultAt || nowTs));
+    }
+    asrMetrics._lastResultAt = nowTs;
     if (interim) {
       state.lastInterim = interim;
       els.liveArea.hidden = false;
@@ -367,6 +407,7 @@ function buildRecognition() {
   };
 
   rec.onend = () => {
+    asrMetrics._endAt = performance.now();
     // 先把尚未定稿的 interim 也提交，避免长句在静音/重启时丢掉后半段
     flushInterim();
 
