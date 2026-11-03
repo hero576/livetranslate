@@ -833,12 +833,23 @@ function submitTyped() {
   const text = els.txtInput.value.trim();
   if (!text) return;
   els.txtInput.value = "";
+  autosizeInput();
   els.emptyState.style.display = "none";
   state.started = true;
   enqueueTranslate(text, false);
 }
 els.btnSend.onclick = submitTyped;
-els.txtInput.onkeydown = (e) => { if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); submitTyped(); } };
+els.txtInput.onkeydown = (e) => {
+  // Enter 发送，Shift+Enter 换行（中文输入法组词中不触发）
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); submitTyped(); }
+};
+/* 输入框自动增高（textarea） */
+function autosizeInput() {
+  const t = els.txtInput;
+  t.style.height = "auto";
+  t.style.height = Math.min(t.scrollHeight, 160) + "px";
+}
+els.txtInput.addEventListener("input", autosizeInput);
 
 /* ---------------------------- 设置 ---------------------------- */
 function saveSettings() {

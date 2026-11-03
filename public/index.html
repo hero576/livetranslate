@@ -172,7 +172,8 @@
 
       <!-- 手动输入 -->
       <section class="typebox">
-        <input type="text" id="txtInput" placeholder="识别不准？直接打字翻译…（回车发送）" autocomplete="off" maxlength="500">
+        <!-- textarea：可多行输入；浏览器不会把 textarea 误判为用户名/密码自动填充字段 -->
+        <textarea id="txtInput" rows="1" placeholder="识别不准？直接打字翻译…（Enter 发送，Shift+Enter 换行）" autocomplete="off" maxlength="2000"></textarea>
         <button id="btnSend" class="send-btn" title="翻译">➤</button>
       </section>
 

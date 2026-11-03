@@ -333,25 +333,31 @@ select:focus, input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px r
 .typebox {
   flex: 0 0 auto;
   display: flex;
+  align-items: flex-end;
   gap: 8px;
   margin: 0 20px 10px;
 }
 
-.typebox input {
+.typebox textarea {
   flex: 1 1 auto;
   min-width: 0;
+  min-height: 44px;
+  max-height: 160px;
   padding: 11px 14px;
   font-size: 14px;
+  line-height: 1.5;
   font-family: var(--font);
   color: var(--fg);
   background: #0e121a;
   border: 1px solid var(--line);
-  border-radius: 999px;
+  border-radius: 14px;
   outline: none;
+  resize: none;
+  overflow-y: auto;
   transition: .18s;
 }
-.typebox input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(79,140,255,.15); }
-.typebox input::placeholder { color: #5c667a; }
+.typebox textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(79,140,255,.15); }
+.typebox textarea::placeholder { color: #5c667a; }
 
 .send-btn {
   flex: 0 0 auto;
