@@ -251,6 +251,17 @@ select:focus, input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px r
   letter-spacing: .3px;
 }
 .time { font-size: 10.5px; color: #5c667a; }
+/* 未定稿（会话结束时残留的 interim）标记，提示可校对 */
+.badge-warn {
+  background: rgba(247,181,56,.16);
+  color: #f7b538;
+  border-color: rgba(247,181,56,.35);
+}
+:root[data-theme="light"] .badge-warn {
+  background: rgba(217,119,6,.12);
+  color: #b45309;
+  border-color: rgba(217,119,6,.25);
+}
 
 .src-line {
   font-size: 13.5px;

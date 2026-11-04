@@ -58,8 +58,11 @@ const state = {
   queue: Promise.resolve(),
   voices: [],
   started: false,
+  /* 识别层状态：以「已确认 final 基线 + 当前 interim 快照」为唯一真相。
+     snapshot = 本次会话到目前为止完整的 final 文本（重启会话时清空）
+     interim  = 当前事件重建的完整临时文本（不是增量拼接） */
+  asrSnapshot: "",
   lastInterim: "",
-  interimCommitted: 0,
 };
 
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -329,13 +332,58 @@ window.asrReport = function () {
   return JSON.stringify(report);
 };
 
+/* ------------------------------------------------------------------ *
+ * ASR 事件记录（追踪丢内容发生在哪一层）
+ * 只在内存环形缓冲，不落库；控制台 asrEvents() 查看最近事件
+ * ------------------------------------------------------------------ */
+const asrTrace = { events: [], session: 0 };
+window.asrEvents = function (n = 30) {
+  const out = asrTrace.events.slice(-n).map((e) => ({
+    t: e.t, idx: e.idx, final: e.isFinal ? "Y" : "",
+    text: e.text.slice(0, 60), alt: e.alts,
+  }));
+  console.table(out);
+  return out.length;
+};
+
+/**
+ * 从事件重建「完整识别快照」。遍历全部 results（不是从 resultIndex 开始），
+ * 因为 Chrome 的 interim 会整句重发、也可能只更新其中一段，只拼增量会丢前文。
+ * 中文不加空格拼接，拉丁文之间补一个空格。
+ */
+function readSnapshot(event) {
+  let finalText = "", interimText = "";
+  const needsSpace = (a, b) => a && b && !/[\u4e00-\u9fff]$/.test(a) && !/^[\u4e00-\u9fff]/.test(b);
+  const append = (acc, piece) => (needsSpace(acc, piece) ? acc + " " + piece : acc + piece);
+  for (let i = 0; i < event.results.length; i++) {
+    const r = event.results[i];
+    const txt = (r[0]?.transcript || "").trim();
+    if (!txt) continue;
+    if (r.isFinal) finalText = append(finalText, txt);
+    else interimText = append(interimText, txt);
+  }
+  return { finalText, interimText };
+}
+
+/* 摘掉完整 final 之后，把最终文本锚定到已提交的末尾，避免重复翻译 */
+function anchorFinal(text) {
+  text = text.trim();
+  if (!text) return "";
+  const joined = (state.asrSnapshot + text).replace(/\s+/g, " ");
+  const parts = joined.split(/(?<=[。！？!?；;…\n])/);
+  if (parts.length <= 1) return text;
+  const last = parts[parts.length - 1].trim();
+  return last || text; // 最后一段是没说完的尾巴，先送去翻译，后续 final 再补
+}
+
 function buildRecognition() {
   if (!SpeechRecognition) return null;
   const rec = new SpeechRecognition();
   rec.continuous = true;
   rec.interimResults = true;
   rec.lang = recognitionLang();
-  rec.maxAlternatives = 1;
+  // 多候选：部分浏览器可返回多个识别候选，用于专有名词/中英混合词的二次判断
+  rec.maxAlternatives = 3;
 
   rec.onstart = () => {
     asrMetrics._sessStart = performance.now();
@@ -344,6 +392,8 @@ function buildRecognition() {
       asrPush(asrMetrics.recover, performance.now() - asrMetrics._endAt);
       asrMetrics._endAt = 0;
     }
+    state.asrSnapshot = ""; // 新会话：final 基线从头累积
+    asrTrace.session++;
     setStatus("识别中…");
   };
 
@@ -353,44 +403,36 @@ function buildRecognition() {
       asrMetrics._firstSeen = true;
       asrPush(asrMetrics.first, nowTs - asrMetrics._sessStart);
     }
-    let interim = "", finalized = "";
-    for (let i = event.resultIndex; i < event.results.length; i++) {
+
+    const { finalText, interimText } = readSnapshot(event);
+
+    // 事件记录：用于排查「浏览器没识别到」vs「我们弄丢了」
+    for (let i = 0; i < event.results.length; i++) {
       const r = event.results[i];
       const txt = (r[0]?.transcript || "").trim();
       if (!txt) continue;
-      if (r.isFinal) finalized += (finalized ? " " : "") + txt;
-      else interim += (interim ? " " : "") + txt;
+      asrTrace.events.push({ t: Math.round(nowTs), idx: i, isFinal: r.isFinal, text: txt, alts: r.length });
+      if (asrTrace.events.length > 400) asrTrace.events.shift();
     }
-    if (finalized) {
-      // 停顿确认延迟：final 与上一个识别事件的间隔（浏览器端点检测耗时）
+
+    if (finalText) {
       asrPush(asrMetrics.confirm, nowTs - (asrMetrics._lastResultAt || nowTs));
+      const remain = anchorFinal(finalText);
+      state.asrSnapshot = finalText; // 基线推进到本次已确认的完整 final
+      state.lastInterim = "";
+      if (remain) handleFinal(remain);
+      els.liveText.textContent = "";
     }
     asrMetrics._lastResultAt = nowTs;
-    if (interim) {
-      state.lastInterim = interim;
+
+    if (interimText) {
+      state.lastInterim = interimText;
       els.liveArea.hidden = false;
-      els.liveText.textContent = interim.slice(state.interimCommitted);
+      els.liveText.textContent = interimText;
       els.liveLang.textContent = "正在听…";
       els.emptyState.style.display = "none";
-      // 「实时」模式：边听边出——长句提前切分 + 停顿自动提交；
-      // 「整句」模式：interim 只显示，等 final 定稿后再翻译（更准）。
-      if (els.selMode.value === "dictation") {
-        commitInterimChunk(interim);
-        armPauseCommit();
-      }
-    }
-    if (finalized) {
-      clearTimeout(state.pauseTimer);
-      // 已通过 interim 提前提交过的前缀，从 final 里剥离，避免重复翻译
-      let remain = finalized;
-      if (state.interimCommitted > 0 && state.lastInterim &&
-          finalized.startsWith(state.lastInterim.slice(0, state.interimCommitted))) {
-        remain = finalized.slice(state.interimCommitted).trim();
-      }
-      if (remain) handleFinal(remain);
-      state.lastInterim = "";
-      state.interimCommitted = 0;
-      els.liveText.textContent = "";
+      // 「实时」模式才做提前展示；是否提交交给停顿判定
+      if (els.selMode.value === "dictation") armPauseCommit();
     }
   };
 
@@ -430,66 +472,58 @@ function buildRecognition() {
   return rec;
 }
 
+/**
+ * 识别语言。注意 Web Speech API 的 rec.lang 是「单值」——浏览器不会替我们
+ * 在中英间自动切换。所以「自动」的真实含义是：按目标语言反推最可能的说话语言。
+ * （说中文就译英文 / 说英文就译中文），而不是把系统语言硬塞进去。
+ */
 function recognitionLang() {
   const v = els.selSrc.value;
-  if (v === "auto") return navigator.language || "zh-CN";
-  return BCP47[v] || v;
+  if (v !== "auto") return BCP47[v] || v;
+  const sys = navigator.language || "zh-CN";
+  const tgt = els.selTgt.value;
+  // 目标语言是中文 → 说话方大概率是英文；目标是非中文 → 说话方大概率是中文
+  const auto = tgt === "zh-CN" || tgt === "zh-TW" ? "en" : "zh-CN";
+  // 系统语言本身就是中文/英文时以系统为准（更贴近本机习惯）
+  if (/^zh/i.test(sys)) return tgt === "en" ? "zh-CN" : "en-US";
+  if (/^en/i.test(sys)) return tgt === "zh-CN" ? "en-US" : "zh-CN";
+  return BCP47[auto] || "zh-CN";
 }
 
-/* 断句优化：interim 是「当前这句」的累积文本，随着说话持续增长。
-   当它够长或遇到句末标点时，把已完整的一部分提前提交，避免：
-   - 超长句把识别引擎撑爆后只吐出开头一小段；
-   - 静音结束/自动重启时把后半段丢掉。 */
-function commitInterimChunk(interim) {
-  const uncommitted = interim.slice(state.interimCommitted);
-  if (uncommitted.length < 40) return;
+/* 停顿自动提交：「实时」模式下，说话者停顿足够久时把 interim 提交。
+   只提交到最后一个句末标点为止——不把「说到一半的词」当定稿，
+   剩余部分继续留在 interim 里等后续识别补全，避免截断与重复。 */
+const SENT_END = /[。！？!?；;…\n.]/;
 
-  let cut = -1;
-  for (const p of ["。", "！", "？", "!", "?", "；", ";", "\n", "."]) {
-    const i = uncommitted.lastIndexOf(p);
-    if (i > cut) cut = i;
-  }
-
-  if (cut < 6) {
-    // 没有句末标点：找最后一个空格；再不行就超长硬切
-    const sp = uncommitted.lastIndexOf(" ");
-    if (sp > 24) cut = sp;
-    else if (uncommitted.length >= 90) cut = 89;
-    else return;
-  }
-
-  const text = uncommitted.slice(0, cut + 1).trim();
-  if (text.length >= 4) {
-    handleFinal(text);
-    state.interimCommitted += cut + 1;
-    els.liveText.textContent = interim.slice(state.interimCommitted);
-  }
-}
-
-/* 停顿自动提交：说话者短暂停顿时（无新识别结果），把已累积的 interim 提交。
-   解决「整句说完但没有标点、Chrome 迟迟不给 final」导致的内容卡住。 */
 function armPauseCommit() {
   clearTimeout(state.pauseTimer);
-  state.pauseTimer = setTimeout(commitPause, 700);
+  const len = (state.lastInterim || "").length;
+  // 句越长越倾向于它是完整句子，等待越短；短句多等一会，减少误切
+  const wait = len >= 60 ? 900 : len >= 30 ? 1200 : 1600;
+  state.pauseTimer = setTimeout(commitPause, wait);
 }
 
 function commitPause() {
   const full = state.lastInterim || "";
-  const rest = full.slice(state.interimCommitted).trim();
-  if (rest.length >= 2) {
-    handleFinal(rest);
-    state.interimCommitted = full.length; // 标记已提交，final 到来时剥离，避免重复
-    els.liveText.textContent = "";
-  }
+  if (!full) return;
+  let lastEnd = -1;
+  for (let i = 0; i < full.length; i++) if (SENT_END.test(full[i])) lastEnd = i;
+  if (lastEnd < 3) return; // 没有完整句，继续等 final 或下一次停顿
+  const text = full.slice(0, lastEnd + 1).trim();
+  if (text.length < 2) return;
+  state.lastInterim = full.slice(lastEnd + 1).trim();
+  handleFinal(text);
+  els.liveText.textContent = state.lastInterim;
 }
 
-/* 把当前还没提交的 interim 尾巴也送出去 */
+/* 会话结束/手动停止时的兜底：把剩余 interim 送出。
+   内容仍属于「浏览器未确认」的部分，标记为待校对（不静默丢弃）。 */
 function flushInterim() {
   clearTimeout(state.pauseTimer);
-  const rest = (state.lastInterim || "").slice(state.interimCommitted).trim();
+  const rest = (state.lastInterim || "").trim();
   state.lastInterim = "";
-  state.interimCommitted = 0;
-  if (rest.length >= 2) handleFinal(rest);
+  asrMetrics._lastResultAt = 0;
+  if (rest.length >= 2) handleFinal(rest, true);
 }
 
 /* 句末没有标点时自动补上，让译文更整齐、也便于按标点断句 */
@@ -499,14 +533,14 @@ function ensurePunct(text) {
   return /[\u4e00-\u9fff]/.test(text) ? text + "。" : text + ".";
 }
 
-function handleFinal(text) {
+function handleFinal(text, unconfirmed = false) {
   state.started = true;
   els.emptyState.style.display = "none";
   text = (text || "").trim();
   if (!text) return;
   text = ensurePunct(text);
   // 定稿即翻译，不再进缓冲等待，避免内容卡在缓冲里迟迟不出现
-  splitChunks(text).forEach((c) => enqueueTranslate(c, true));
+  splitChunks(text).forEach((c) => enqueueTranslate(c, true, unconfirmed));
   setStatus("识别中…");
 }
 
@@ -524,15 +558,20 @@ function splitChunks(text) {
   return out.flatMap((s) => s.length <= hard ? [s] : s.match(new RegExp(`.{1,${hard}}`, "gs")) || [s]);
 }
 
-function enqueueTranslate(text, isSpeech = false) {
-  state.queue = state.queue.then(() => doTranslate(text, isSpeech)).catch(() => {});
+function enqueueTranslate(text, isSpeech = false, unconfirmed = false) {
+  state.queue = state.queue.then(() => doTranslate(text, isSpeech, unconfirmed)).catch(() => {});
   return state.queue;
 }
 
-async function doTranslate(text, isSpeech) {
+async function doTranslate(text, isSpeech, unconfirmed = false) {
   const tgtLang = els.selTgt.value;
   const node = createBlock(text);
   node.src = text;
+  if (unconfirmed && node.badge) {
+    node.badge.textContent = "待校对 · 会话结束时未定稿";
+    node.badge.title = "这段文字浏览器还没确认，可能不准确，可用「✎ 修正」改原文";
+    node.badge.classList.add("badge-warn");
+  }
   state.translating++;
   updateBusy();
 
@@ -544,7 +583,9 @@ async function doTranslate(text, isSpeech) {
     node.tgtEl.textContent = d.text;
     node.tgtEl.classList.remove("loading");
     const fromLabel = d.detected && LANG_NAME[d.detected] ? LANG_NAME[d.detected] : d.detected;
-    if (fromLabel) node.badge.textContent = d.skipped ? `${fromLabel}（已是目标语言）` : `${fromLabel} → ${LANG_NAME[tgtLang] || tgtLang}`;
+    const dirLabel = d.skipped ? `${fromLabel}（已是目标语言）` : `${fromLabel} → ${LANG_NAME[tgtLang] || tgtLang}`;
+    // 未定稿标记优先保留，方便回头校对
+    node.badge.textContent = unconfirmed ? `待校对 · ${dirLabel}` : dirLabel;
 
     // 实时同步到服务器，记录消息 id 以便「修正重译」时原地更新
     node.msgId = await syncMessage({
@@ -894,7 +935,14 @@ els.btnSwap.onclick = () => {
 
 [els.selTgt, els.selMode, els.selEngine].forEach((el) => el.addEventListener("change", saveSettings));
 els.selTheme.addEventListener("change", () => { applyTheme(els.selTheme.value); saveSettings(); });
-els.selSrc.addEventListener("change", () => { if (state.listening) { try { state.recognition.stop(); } catch { /* onend restart */ } } });
+/* 「自动」识别时 rec.lang 由目标语言反推，改语言需重启识别会话才生效 */
+[els.selSrc, els.selTgt].forEach((el) =>
+  el.addEventListener("change", () => {
+    if (state.listening) { try { state.recognition.stop(); } catch { /* onend 自动重启 */ } }
+  })
+);
+/* 切模式时清掉待触发的停顿提交，避免残留定时器把旧 interim 送出去 */
+els.selMode.addEventListener("change", () => clearTimeout(state.pauseTimer));
 els.rngRate.addEventListener("input", () => { els.rateVal.textContent = Number(els.rngRate.value).toFixed(1) + "x"; saveSettings(); });
 els.rngFont.addEventListener("input", () => { applyFont(Number(els.rngFont.value)); saveSettings(); });
 els.selVoice.addEventListener("change", () => { localStorage.setItem("lt.voice", els.selVoice.value); saveSettings(); });
