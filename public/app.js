@@ -59,10 +59,11 @@ const state = {
   voices: [],
   started: false,
   /* 识别层状态：以「已确认 final 基线 + 当前 interim 快照」为唯一真相。
-     snapshot = 本次会话到目前为止完整的 final 文本（重启会话时清空）
-     interim  = 当前事件重建的完整临时文本（不是增量拼接） */
-  asrSnapshot: "",
+     lastInterim   = 尚未提交的识别文本（不是增量拼接）
+     lastCommitted = 已通过 interim 提交翻译过的文本（用于 final 去重） */
   lastInterim: "",
+  lastCommitted: "",
+  committedAt: 0,
 };
 
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -365,15 +366,29 @@ function readSnapshot(event) {
   return { finalText, interimText };
 }
 
-/* 摘掉完整 final 之后，把最终文本锚定到已提交的末尾，避免重复翻译 */
-function anchorFinal(text) {
-  text = text.trim();
-  if (!text) return "";
-  const joined = (state.asrSnapshot + text).replace(/\s+/g, " ");
-  const parts = joined.split(/(?<=[。！？!?；;…\n])/);
-  if (parts.length <= 1) return text;
-  const last = parts[parts.length - 1].trim();
-  return last || text; // 最后一段是没说完的尾巴，先送去翻译，后续 final 再补
+/* 把「本次 final」中尚未翻译过的部分摘出来。
+   规则：final 通常是当前结果缓冲区从头重发的整段，只要它以前面已翻译过的文本开头，
+   就把那段前缀剥掉，剩下的才送翻译——避免同一句被翻译两次。 */
+function dedupeFinal(finalText) {
+  const norm = (s) => s.replace(/\s+/g, " ").trim();
+  const a = norm(finalText || "");
+  const prev = norm(state.lastCommitted || "");
+  if (!prev) return a;
+  if (a.startsWith(prev)) return a.slice(prev.length).trim();
+  // 忽略空白再比一次（识别结果里的空格数会来回变，不能作为判重依据）
+  const squash = (s) => s.replace(/\s+/g, "");
+  const pa = squash(a), pb = squash(prev);
+  if (pa.startsWith(pb)) {
+    // 用非空白字符数定位真实截断点
+    let cnt = 0, cut = 0;
+    for (let i = 0; i < a.length; i++) {
+      if (!/\s/.test(a[i])) cnt++;
+      if (cnt === pb.length) { cut = i + 1; break; }
+    }
+    return a.slice(cut).trim();
+  }
+  // final 比预期短（引擎修订了前文）：只提交它，不和旧文本叠加，避免制造重复
+  return pa.length >= pb.length ? a : "";
 }
 
 function buildRecognition() {
@@ -392,7 +407,6 @@ function buildRecognition() {
       asrPush(asrMetrics.recover, performance.now() - asrMetrics._endAt);
       asrMetrics._endAt = 0;
     }
-    state.asrSnapshot = ""; // 新会话：final 基线从头累积
     asrTrace.session++;
     setStatus("识别中…");
   };
@@ -417,18 +431,25 @@ function buildRecognition() {
 
     if (finalText) {
       asrPush(asrMetrics.confirm, nowTs - (asrMetrics._lastResultAt || nowTs));
-      const remain = anchorFinal(finalText);
-      state.asrSnapshot = finalText; // 基线推进到本次已确认的完整 final
+      // 剥掉「已通过 interim 提交过」的前缀，避免同一句翻译两次
+      const remain = dedupeFinal(finalText);
+      state.lastCommitted = ""; // 本段已定稿，基线清空，下一句重新累积
       state.lastInterim = "";
+      clearTimeout(state.pauseTimer);
       if (remain) handleFinal(remain);
       els.liveText.textContent = "";
     }
     asrMetrics._lastResultAt = nowTs;
 
     if (interimText) {
-      state.lastInterim = interimText;
+      // interimText 是「本段从头重发的完整临时文本」，可能包含已经提交过的前缀；
+      // 剥掉前缀后再更新待提交部分（此时 lastInterim 恰为上次提交后剩下的尾巴）
+      const pending = dedupeFinal(interimText);
+      if (pending) {
+        state.lastInterim = pending;
+        els.liveText.textContent = pending;
+      }
       els.liveArea.hidden = false;
-      els.liveText.textContent = interimText;
       els.liveLang.textContent = "正在听…";
       els.emptyState.style.display = "none";
       // 「实时」模式才做提前展示；是否提交交给停顿判定
@@ -464,6 +485,8 @@ function buildRecognition() {
       clearTimeout(state.restartTimer);
       state.restartTimer = setTimeout(() => {
         if (!state.listening) return;
+        // 新会话可能从缓冲区开头重发同一段内容，保留 8 秒内的去重基线
+        if (Date.now() - (state.committedAt || 0) > 8000) state.lastCommitted = "";
         try { rec.lang = recognitionLang(); rec.start(); setStatus("识别中…"); } catch { /* ignore */ }
       }, 120);
     }
@@ -494,6 +517,8 @@ function recognitionLang() {
    只提交到最后一个句末标点为止——不把「说到一半的词」当定稿，
    剩余部分继续留在 interim 里等后续识别补全，避免截断与重复。 */
 const SENT_END = /[。！？!?；;…\n.]/;
+/* 没有标点时，interim 达到这个长度就认为是一句话（中文约 10 字 / 英文约 18 词） */
+const PAUSE_MIN_LEN = 12;
 
 function armPauseCommit() {
   clearTimeout(state.pauseTimer);
@@ -503,17 +528,30 @@ function armPauseCommit() {
   state.pauseTimer = setTimeout(commitPause, wait);
 }
 
+/* 停顿提交。Chrome 的 interim 基本不带标点，所以不能死等句末标点：
+   - 有句末标点 → 切到最后一个标点，剩余留下等 final
+   - 没有标点但已经够长（或停顿够久）→ 整段提交，并把已提交文本记为基线，
+     后续 final 重发整段时由 dedupeFinal 剥掉前缀，不会重复翻译 */
 function commitPause() {
   const full = state.lastInterim || "";
   if (!full) return;
   let lastEnd = -1;
   for (let i = 0; i < full.length; i++) if (SENT_END.test(full[i])) lastEnd = i;
-  if (lastEnd < 3) return; // 没有完整句，继续等 final 或下一次停顿
-  const text = full.slice(0, lastEnd + 1).trim();
+
+  let text, rest;
+  if (lastEnd >= 3) {
+    text = full.slice(0, lastEnd + 1).trim();
+    rest = full.slice(lastEnd + 1).trim();
+  } else if (full.trim().length >= PAUSE_MIN_LEN) {
+    text = full.trim();
+    rest = "";
+  } else {
+    return; // 太短，继续等
+  }
   if (text.length < 2) return;
-  state.lastInterim = full.slice(lastEnd + 1).trim();
-  handleFinal(text);
-  els.liveText.textContent = state.lastInterim;
+  state.lastInterim = rest;
+  handleFinal(text, false, true);
+  els.liveText.textContent = rest;
 }
 
 /* 会话结束/手动停止时的兜底：把剩余 interim 送出。
@@ -523,7 +561,7 @@ function flushInterim() {
   const rest = (state.lastInterim || "").trim();
   state.lastInterim = "";
   asrMetrics._lastResultAt = 0;
-  if (rest.length >= 2) handleFinal(rest, true);
+  if (rest.length >= 2) handleFinal(rest, true, true);
 }
 
 /* 句末没有标点时自动补上，让译文更整齐、也便于按标点断句 */
@@ -533,11 +571,17 @@ function ensurePunct(text) {
   return /[\u4e00-\u9fff]/.test(text) ? text + "。" : text + ".";
 }
 
-function handleFinal(text, unconfirmed = false) {
+/* text：要翻译的内容；unconfirmed：浏览器未定稿（会话结束时残留）；
+   fromInterim：来自临时结果，需要计入「已提交基线」供 final 去重 */
+function handleFinal(text, unconfirmed = false, fromInterim = false) {
   state.started = true;
   els.emptyState.style.display = "none";
   text = (text || "").trim();
   if (!text) return;
+  if (fromInterim) {
+    state.lastCommitted = (state.lastCommitted + text).trim();
+    state.committedAt = Date.now();
+  }
   text = ensurePunct(text);
   // 定稿即翻译，不再进缓冲等待，避免内容卡在缓冲里迟迟不出现
   splitChunks(text).forEach((c) => enqueueTranslate(c, true, unconfirmed));
