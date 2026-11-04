@@ -64,8 +64,8 @@ const state = {
   lastInterim: "",
   lastCommitted: "",
   committedAt: 0,
-  finalSeen: {},   // result 索引 → 已处理的 final 文本（防重复提交）
-  interimSeen: "", // 上一次看到的 interim 文本（无变化则不重置停顿计时）
+  finalSeen: new Map(), // final 文本 → 处理时间（同一句话可能被真说两次，需带时间窗口）
+  interimSeen: "",      // 上一次看到的 interim（无变化则不重置停顿计时）
 };
 
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -351,13 +351,18 @@ window.asrEvents = function (n = 30) {
 
 /**
  * 从事件重建「完整识别快照」。
- * 关键点：event.results 是「整个识别会话的累积数组」，已经定稿的 result 会一直留在里面
- * （且 isFinal=true 不再变化）。所以必须按索引跳过已处理过的 final，否则同一句会被
- * 每个后续事件重复提交。
+ *
+ * 浏览器行为（实测）：
+ *  1. event.results 会随会话推进「移除已定稿的旧项」，索引会重排/跳号（日志里 0 → 2）；
+ *     所以绝不能按索引判断新 final。
+ *  2. 同一条 final 会在后续事件里被重复上报（isFinal 恒为 true，内容不变）。
+ *  3. interim 会被「修订」而非只追加（日志里 没问题然后的话接 → 没问题 → 没问题然后的话接下）。
+ *
+ * 结论：final 用「内容 + 已处理集合」去重；interim 直接以最后一次上报为准。
  */
 function readSnapshot(event) {
-  let finalText = "", interimText = "";
-  const freshFinals = []; // 本次新出现的 final（按 result 索引判定）
+  let interimText = "";
+  const freshFinals = [];
   const needsSpace = (a, b) => a && b && !/[\u4e00-\u9fff]$/.test(a) && !/^[\u4e00-\u9fff]/.test(b);
   const append = (acc, piece) => (needsSpace(acc, piece) ? acc + " " + piece : acc + piece);
   for (let i = 0; i < event.results.length; i++) {
@@ -365,17 +370,19 @@ function readSnapshot(event) {
     const txt = (r[0]?.transcript || "").trim();
     if (!txt) continue;
     if (r.isFinal) {
-      finalText = append(finalText, txt);
-      // 该索引的 final 文本与上次记录不同 → 是新定稿
-      if (state.finalSeen[i] !== txt) {
-        state.finalSeen[i] = txt;
+      // 同一条 final 会被反复上报（内容一字不差）；但同一句话也可能被真说两次，
+      // 所以只在「短时间内重复上报」时才判为重复。
+      const seenAt = state.finalSeen.get(txt);
+      const now = Date.now();
+      if (!seenAt || now - seenAt > FINAL_REPEAT_WINDOW) {
+        state.finalSeen.set(txt, now);
         freshFinals.push(txt);
       }
     } else {
       interimText = append(interimText, txt);
     }
   }
-  return { finalText, freshFinal: freshFinals.join(""), interimText };
+  return { freshFinal: freshFinals.join(""), interimText };
 }
 
 /* 把「本次 final」中尚未翻译过的部分摘出来。
@@ -419,7 +426,7 @@ function buildRecognition() {
       asrPush(asrMetrics.recover, performance.now() - asrMetrics._endAt);
       asrMetrics._endAt = 0;
     }
-    state.finalSeen = {};   // 新会话的 result 索引从头开始
+    state.finalSeen = new Map(); // 新会话：清空已处理 final
     state.interimSeen = "";
     asrTrace.session++;
     setStatus("识别中…");
@@ -432,7 +439,7 @@ function buildRecognition() {
       asrPush(asrMetrics.first, nowTs - asrMetrics._sessStart);
     }
 
-    const { finalText, freshFinal, interimText } = readSnapshot(event);
+    const { freshFinal, interimText } = readSnapshot(event);
 
     // 事件记录：用于排查「浏览器没识别到」vs「我们弄丢了」
     for (let i = 0; i < event.results.length; i++) {
@@ -443,13 +450,21 @@ function buildRecognition() {
       if (asrTrace.events.length > 400) asrTrace.events.shift();
     }
 
-    // 只处理「本次新定稿」的 final；已经处理过的 final 会一直留在 results 里，不能重复提交
+    // 只处理「本次新定稿」的 final；已处理过的 final 会被浏览器反复上报，不能重复提交
     if (freshFinal) {
       asrPush(asrMetrics.confirm, nowTs - (asrMetrics._lastResultAt || nowTs));
+      // 防丢内容：浏览器的 final 有时比它自己给出的 interim 更短（修订时把后半句吞掉了）。
+      // 这种情况下 interim 才是更完整的版本，取更长的一份。
+      let text = freshFinal;
+      const pend = (state.lastInterim || "").trim();
+      if (pend.length > text.length && pend.includes(text.slice(0, Math.min(6, text.length)))) {
+        text = pend;
+      }
       // 剥掉「已通过 interim 提交过」的前缀，避免同一句翻译两次
-      const remain = dedupeFinal(freshFinal);
+      const remain = dedupeFinal(text);
       state.lastCommitted = ""; // 本段已定稿，基线清空，下一句重新累积
       state.lastInterim = "";
+      state.interimSeen = "";
       clearTimeout(state.pauseTimer);
       if (remain) handleFinal(remain);
       els.liveText.textContent = "";
@@ -537,6 +552,8 @@ function recognitionLang() {
 const SENT_END = /[。！？!?；;…\n.]/;
 /* 没有标点时，interim 达到这个长度就认为是一句话（中文约 10 字 / 英文约 18 词） */
 const PAUSE_MIN_LEN = 12;
+/* 同一条 final 在该时间窗内重复上报视为同一句（浏览器最多重发数秒） */
+const FINAL_REPEAT_WINDOW = 30000;
 
 function armPauseCommit() {
   clearTimeout(state.pauseTimer);
