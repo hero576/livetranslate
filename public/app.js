@@ -64,6 +64,8 @@ const state = {
   lastInterim: "",
   lastCommitted: "",
   committedAt: 0,
+  finalSeen: {},   // result 索引 → 已处理的 final 文本（防重复提交）
+  interimSeen: "", // 上一次看到的 interim 文本（无变化则不重置停顿计时）
 };
 
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -348,22 +350,32 @@ window.asrEvents = function (n = 30) {
 };
 
 /**
- * 从事件重建「完整识别快照」。遍历全部 results（不是从 resultIndex 开始），
- * 因为 Chrome 的 interim 会整句重发、也可能只更新其中一段，只拼增量会丢前文。
- * 中文不加空格拼接，拉丁文之间补一个空格。
+ * 从事件重建「完整识别快照」。
+ * 关键点：event.results 是「整个识别会话的累积数组」，已经定稿的 result 会一直留在里面
+ * （且 isFinal=true 不再变化）。所以必须按索引跳过已处理过的 final，否则同一句会被
+ * 每个后续事件重复提交。
  */
 function readSnapshot(event) {
   let finalText = "", interimText = "";
+  const freshFinals = []; // 本次新出现的 final（按 result 索引判定）
   const needsSpace = (a, b) => a && b && !/[\u4e00-\u9fff]$/.test(a) && !/^[\u4e00-\u9fff]/.test(b);
   const append = (acc, piece) => (needsSpace(acc, piece) ? acc + " " + piece : acc + piece);
   for (let i = 0; i < event.results.length; i++) {
     const r = event.results[i];
     const txt = (r[0]?.transcript || "").trim();
     if (!txt) continue;
-    if (r.isFinal) finalText = append(finalText, txt);
-    else interimText = append(interimText, txt);
+    if (r.isFinal) {
+      finalText = append(finalText, txt);
+      // 该索引的 final 文本与上次记录不同 → 是新定稿
+      if (state.finalSeen[i] !== txt) {
+        state.finalSeen[i] = txt;
+        freshFinals.push(txt);
+      }
+    } else {
+      interimText = append(interimText, txt);
+    }
   }
-  return { finalText, interimText };
+  return { finalText, freshFinal: freshFinals.join(""), interimText };
 }
 
 /* 把「本次 final」中尚未翻译过的部分摘出来。
@@ -407,6 +419,8 @@ function buildRecognition() {
       asrPush(asrMetrics.recover, performance.now() - asrMetrics._endAt);
       asrMetrics._endAt = 0;
     }
+    state.finalSeen = {};   // 新会话的 result 索引从头开始
+    state.interimSeen = "";
     asrTrace.session++;
     setStatus("识别中…");
   };
@@ -418,7 +432,7 @@ function buildRecognition() {
       asrPush(asrMetrics.first, nowTs - asrMetrics._sessStart);
     }
 
-    const { finalText, interimText } = readSnapshot(event);
+    const { finalText, freshFinal, interimText } = readSnapshot(event);
 
     // 事件记录：用于排查「浏览器没识别到」vs「我们弄丢了」
     for (let i = 0; i < event.results.length; i++) {
@@ -429,10 +443,11 @@ function buildRecognition() {
       if (asrTrace.events.length > 400) asrTrace.events.shift();
     }
 
-    if (finalText) {
+    // 只处理「本次新定稿」的 final；已经处理过的 final 会一直留在 results 里，不能重复提交
+    if (freshFinal) {
       asrPush(asrMetrics.confirm, nowTs - (asrMetrics._lastResultAt || nowTs));
       // 剥掉「已通过 interim 提交过」的前缀，避免同一句翻译两次
-      const remain = dedupeFinal(finalText);
+      const remain = dedupeFinal(freshFinal);
       state.lastCommitted = ""; // 本段已定稿，基线清空，下一句重新累积
       state.lastInterim = "";
       clearTimeout(state.pauseTimer);
@@ -442,8 +457,11 @@ function buildRecognition() {
     asrMetrics._lastResultAt = nowTs;
 
     if (interimText) {
+      // interim 无实际变化（Chrome 会重复上报同一段）时不重置停顿计时，否则永远等不到提交
+      const changed = interimText !== state.interimSeen;
+      state.interimSeen = interimText;
       // interimText 是「本段从头重发的完整临时文本」，可能包含已经提交过的前缀；
-      // 剥掉前缀后再更新待提交部分（此时 lastInterim 恰为上次提交后剩下的尾巴）
+      // 剥掉前缀后再更新待提交部分
       const pending = dedupeFinal(interimText);
       if (pending) {
         state.lastInterim = pending;
@@ -452,8 +470,8 @@ function buildRecognition() {
       els.liveArea.hidden = false;
       els.liveLang.textContent = "正在听…";
       els.emptyState.style.display = "none";
-      // 「实时」模式才做提前展示；是否提交交给停顿判定
-      if (els.selMode.value === "dictation") armPauseCommit();
+      // 「实时」模式才做提前展示；只有内容真的变化时才重新计时
+      if (changed && els.selMode.value === "dictation") armPauseCommit();
     }
   };
 
