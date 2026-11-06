@@ -5,6 +5,7 @@
 | 文档 | 内容 |
 | --- | --- |
 | [asr/v2.0.1-recognition-integrity.md](asr/v2.0.1-recognition-integrity.md) | V2.0.1：语音识别完整性修复（临时气泡、final 判重、停止顺序、重启状态机、中断提示） |
+| [deploy/staging.md](deploy/staging.md) | 测试版部署：同域名按 cookie 分流到 8010，独立数据库，用于真机验证 PR |
 
 ## 约定
 
