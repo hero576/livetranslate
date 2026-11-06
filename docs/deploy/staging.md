@@ -66,3 +66,7 @@ nginx -t && nginx -s reload
 
 - 测试版和线上版共用同一个翻译出口（Bing/Google），会一起消耗配额。
 - PR 合并到 `master` 后会自动部署线上版，但测试版不会跟着更新，需要按上面的步骤手动更新。
+
+## 变更记录
+
+- V2.1.0：测试版的 `.env` 增加 `ASR_URL=ws://127.0.0.1:8011`，启用服务端识别；识别服务 `livetranslate-asr`（只监听本机 8011）的部署见 [../asr/v2.1.0-server-asr.md](../asr/v2.1.0-server-asr.md)。线上版 `.env` 未加 `ASR_URL`，仍只用浏览器识别。

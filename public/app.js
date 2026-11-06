@@ -28,7 +28,7 @@ const els = {
   app: $("app"), btnAdmin: $("btnAdmin"), btnSettings: $("btnSettings"), btnHelp: $("btnHelp"),
   btnLogout: $("btnLogout"), userAvatar: $("userAvatar"), userName: $("userName"),
   sidebar: $("sidebar"), convList: $("convList"), btnNewConv: $("btnNewConv"),
-  selSrc: $("selSrc"), selTgt: $("selTgt"), selMode: $("selMode"), selEngine: $("selEngine"),
+  selSrc: $("selSrc"), selTgt: $("selTgt"), selAsr: $("selAsr"), selMode: $("selMode"), selEngine: $("selEngine"),
   selVoice: $("selVoice"), chkAuto: $("chkAuto"), chkDual: $("chkDual"),
   btnSwap: $("btnSwap"), btnMic: $("btnMic"), btnClear: $("btnClear"), btnExport: $("btnExport"),
   btnFull: $("btnFull"), txtInput: $("txtInput"), btnSend: $("btnSend"),
@@ -63,6 +63,8 @@ const state = {
      failures: 连续出错次数（决定退避时长，收到识别结果后清零）
      downSince/downReason: 当前这次识别中断从何时开始、因为什么 */
   asr: { phase: "idle", failures: 0, downSince: 0, downReason: "", startWatchdog: null, stopFallback: null },
+  srv: null,          // 服务端识别会话（麦克风 + AudioWorklet + WebSocket）
+  asrServer: false,   // 服务端识别是否可用（/api/asr/status）
   provisional: null, // 当前临时气泡（interim 的先行翻译，等 final 原地替换）
 };
 
@@ -188,6 +190,7 @@ function enterApp() {
   els.userAvatar.textContent = state.user.username.slice(0, 1).toUpperCase();
   if (state.user.role === "admin") els.btnAdmin.hidden = false;
   loadConversations();
+  loadAsrStatus();
 }
 
 /* ---------------------------- 会话管理 ---------------------------- */
@@ -659,8 +662,8 @@ function showProvisional(raw) {
     state.provisional = node;
   }
   setBlockSrc(node, text);
-  node.badge.textContent = "临时 · 等待浏览器定稿";
-  node.badge.title = "这段是识别中的临时结果，浏览器定稿后会自动替换";
+  node.badge.textContent = "临时 · 等待定稿";
+  node.badge.title = "这段是识别中的临时结果，定稿后会自动替换";
   const ver = (node.ver = (node.ver || 0) + 1);
   const to = els.selTgt.value;
   requestTranslate(text, to)
@@ -1036,19 +1039,277 @@ function stopTts() {
   speechSynthesis.cancel();
 }
 
+/* ---------------------------- 服务端识别 ---------------------------- *
+ * 浏览器只采集音频：AudioWorklet 转成 16k 单声道 int16 PCM，经 WebSocket(/api/asr)
+ * 发给服务器，服务器 SenseVoice 识别后回 partial / final。partial 走 run.interim + 临时气泡，
+ * final 走 commitFinal，与浏览器识别共用同一套入库、翻译、待校对逻辑。
+ * 断线期间麦克风不停，音频先缓存（最多 SRV_BACKLOG_MAX_MS），重连后补发；
+ * 只有缓存溢出、真正丢了音频时才记一次识别中断。详见 docs/asr/v2.1.0-server-asr.md */
+const SRV_BACKLOG_MAX_MS = 60000;
+const SRV_CHUNK_MS = 100;           // asr-worklet.js 每块 100ms
+const SRV_STOP_TIMEOUT = 6000;      // 手动停止后最多等服务器识别完最后一段
+
+function asrEngine() {
+  return state.asrServer && els.selAsr.value === "server" ? "server" : "browser";
+}
+
+async function loadAsrStatus() {
+  try {
+    const d = await api("/api/asr/status");
+    state.asrServer = !!d.enabled && !!window.AudioWorkletNode && !!window.WebSocket;
+  } catch { state.asrServer = false; }
+  els.selAsr.querySelector('option[value="server"]').disabled = !state.asrServer;
+  if (!state.asrServer) els.selAsr.value = "browser";
+}
+
+function srvLang() {
+  const v = els.selSrc.value;
+  return v === "zh-CN" || v === "zh-TW" ? "zh" : ["yue", "en", "ja", "ko"].includes(v) ? v : "auto";
+}
+
+async function startServerListening() {
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+  } catch {
+    alert("无法访问麦克风，请检查系统权限设置。");
+    return "denied";
+  }
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  try {
+    await ctx.audioWorklet.addModule("asr-worklet.js");
+  } catch (e) {
+    stream.getTracks().forEach((t) => t.stop());
+    ctx.close();
+    asrNote("worklet-failed", e && e.message);
+    return false;
+  }
+  const src = ctx.createMediaStreamSource(stream);
+  const node = new AudioWorkletNode(ctx, "pcm16k");
+  const mute = ctx.createGain();
+  mute.gain.value = 0; // 只为让音频图持续运转，不把麦克风声音放出来
+  src.connect(node);
+  node.connect(mute);
+  mute.connect(ctx.destination);
+  if (ctx.state === "suspended") ctx.resume().catch(() => {});
+
+  const run = { id: 0, startedAt: 0, interim: "", interimSeen: "", recentFinals: [], lastError: "" };
+  const srv = {
+    stream, ctx, node, run, ws: null, ready: false, everReady: false, timer: null, watchdog: null,
+    backlog: [], dropFrom: 0, dropTo: 0, seenFinals: new Set(),
+  };
+  state.srv = srv;
+  node.port.onmessage = (e) => srvAudio(srv, e.data);
+  srvConnect(srv);
+  return true;
+}
+
+function srvAudio(srv, buf) {
+  if (!state.listening || srv !== state.srv) return;
+  const ws = srv.ws;
+  if (ws && ws.readyState === WebSocket.OPEN && srv.ready) { ws.send(buf); return; }
+  srv.backlog.push(buf);
+  if (srv.backlog.length * SRV_CHUNK_MS > SRV_BACKLOG_MAX_MS) {
+    srv.backlog.shift();
+    const now = Date.now();
+    if (!srv.dropFrom) srv.dropFrom = now - SRV_BACKLOG_MAX_MS;
+    srv.dropTo = now - SRV_BACKLOG_MAX_MS;
+  }
+}
+
+function srvConnect(srv) {
+  if (!state.listening || srv !== state.srv) return;
+  asrSetPhase("starting", "server");
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${location.host}/api/asr?token=${encodeURIComponent(state.token || "")}`);
+  ws.binaryType = "arraybuffer";
+  srv.ws = ws;
+  srv.ready = false;
+  clearTimeout(srv.watchdog);
+  srv.watchdog = setTimeout(() => {
+    if (srv.ws === ws && !srv.ready) { asrNote("start-timeout", "server"); ws.close(); }
+  }, ASR_START_TIMEOUT);
+  ws.onopen = () => ws.send(JSON.stringify({ type: "start", lang: srvLang() }));
+  ws.onmessage = (e) => {
+    if (srv.ws !== ws || typeof e.data !== "string") return;
+    let m;
+    try { m = JSON.parse(e.data); } catch { return; }
+    srvMessage(srv, ws, m);
+  };
+  ws.onclose = (e) => srvClosed(srv, ws, e);
+}
+
+function srvMessage(srv, ws, m) {
+  const run = srv.run;
+  const nowTs = performance.now();
+  switch (m.type) {
+    case "ready": {
+      clearTimeout(srv.watchdog);
+      srv.ready = true;
+      srv.everReady = true;
+      run.id = ++asrTrace.session;
+      run.startedAt = Date.now();
+      run.interim = run.interimSeen = "";
+      srv.seenFinals.clear();
+      state.asr.failures = 0;
+      asrMetrics._sessStart = nowTs;
+      asrMetrics._firstSeen = false;
+      if (asrMetrics._endAt) { asrPush(asrMetrics.recover, nowTs - asrMetrics._endAt); asrMetrics._endAt = 0; }
+      if (srv.dropFrom) {
+        recordGap(srv.dropFrom, srv.dropTo, "服务器断线超过缓存时长");
+        srv.dropFrom = srv.dropTo = 0;
+      }
+      // 断线期间缓存的音频按顺序补发
+      const backlog = srv.backlog.splice(0);
+      if (backlog.length) asrNote("backlog-sent", `${(backlog.length * SRV_CHUNK_MS / 1000).toFixed(1)}s`);
+      for (const b of backlog) ws.send(b);
+      if (state.listening) {
+        asrSetPhase("listening", "server");
+        setStatus("识别中（服务器）…");
+      }
+      return;
+    }
+    case "partial": {
+      if (srv.seenFinals.has(m.seg)) return; // 晚到的 partial，该段已定稿
+      if (!asrMetrics._firstSeen && asrMetrics._sessStart) {
+        asrMetrics._firstSeen = true;
+        asrPush(asrMetrics.first, nowTs - asrMetrics._sessStart);
+      }
+      asrLog({ idx: m.seg, isFinal: false, text: m.text });
+      asrMetrics._lastResultAt = nowTs;
+      run.interim = (m.text || "").trim();
+      renderInterim(run);
+      return;
+    }
+    case "final": {
+      if (srv.seenFinals.has(m.seg)) { asrNote("final-dup", m.text); return; }
+      srv.seenFinals.add(m.seg);
+      asrLog({ idx: m.seg, isFinal: true, text: m.text, alts: m.decode_ms != null ? `${m.decode_ms}ms` : "" });
+      asrPush(asrMetrics.confirm, nowTs - (asrMetrics._lastResultAt || nowTs));
+      asrMetrics._lastResultAt = 0;
+      run.interim = run.interimSeen = "";
+      els.liveText.textContent = "";
+      const text = (m.text || "").trim();
+      if (text) { asrNote("final", text); commitFinal(text); }
+      else if (state.provisional) commitFinal(""); // 整段识别为空（噪声），撤掉对应的临时气泡
+      return;
+    }
+    case "end":
+      asrNote("server-end");
+      ws.close();
+      return;
+    case "error":
+      run.lastError = m.error || "error";
+      asrNote("error", `${m.error} ${m.message || ""}`);
+      if (m.message) setStatus(m.message);
+      return;
+  }
+}
+
+function srvClosed(srv, ws, e) {
+  if (srv.ws !== ws) return;
+  clearTimeout(srv.watchdog);
+  srv.ws = null;
+  srv.ready = false;
+  asrMetrics._endAt = performance.now();
+  asrNote("end", `ws ${e.code}${e.reason ? " " + e.reason : ""}`);
+  flushResidual(srv.run); // 断线时未定稿的 partial 以「待校对」保留
+  if (srv !== state.srv) { srvTeardown(srv); return; }
+  if (!state.listening) { srvTeardown(srv); finishStop(); return; }
+
+  state.asr.failures++;
+  // 一次都没连上：服务器识别不可用，回到浏览器识别，不让用户对着没反应的页面说话
+  if (!srv.everReady && state.asr.failures >= 2 && SpeechRecognition) {
+    asrNote("fallback", "browser");
+    srvTeardown(srv);
+    setStatus("服务器识别不可用，已切换到浏览器识别");
+    startBrowserListening();
+    return;
+  }
+  const n = state.asr.failures;
+  const delay = Math.min(ASR_BACKOFF_BASE * 2 ** (n - 1), ASR_BACKOFF_MAX);
+  asrSetPhase("restart_wait", `server ${delay}ms · failures=${n}`);
+  setStatus(`识别服务断开，${(delay / 1000).toFixed(1)} 秒后重连（音频已缓存）…`);
+  clearTimeout(srv.timer);
+  srv.timer = setTimeout(() => srvConnect(srv), delay);
+}
+
+function stopServerListening() {
+  const srv = state.srv;
+  clearTimeout(srv.timer);
+  srv.node.port.onmessage = null;
+  srv.stream.getTracks().forEach((t) => t.stop()); // 立刻关麦克风
+  const ws = srv.ws;
+  if (ws && ws.readyState === WebSocket.OPEN && srv.ready) {
+    asrSetPhase("stopping", "server");
+    ws.send(JSON.stringify({ type: "stop" }));
+    clearTimeout(state.asr.stopFallback);
+    state.asr.stopFallback = setTimeout(() => {
+      if (srv.ws !== ws) return;
+      asrNote("stop-timeout", "server");
+      srv.ws = null;
+      try { ws.close(); } catch { /* ignore */ }
+      flushResidual(srv.run);
+      srvTeardown(srv);
+      finishStop();
+    }, SRV_STOP_TIMEOUT);
+    setStatus("正在收尾…");
+  } else {
+    if (srv.backlog.length) asrNote("backlog-dropped", `${(srv.backlog.length * SRV_CHUNK_MS / 1000).toFixed(1)}s`);
+    srv.ws = null;
+    if (ws) try { ws.close(); } catch { /* ignore */ }
+    flushResidual(srv.run);
+    srvTeardown(srv);
+    finishStop();
+  }
+}
+
+function srvTeardown(srv) {
+  clearTimeout(srv.timer);
+  clearTimeout(srv.watchdog);
+  srv.node.port.onmessage = null;
+  srv.backlog = [];
+  try { srv.node.disconnect(); } catch { /* ignore */ }
+  srv.stream.getTracks().forEach((t) => t.stop());
+  srv.ctx.close().catch(() => {});
+  if (state.srv === srv) state.srv = null;
+}
+
 /* ---------------------------- 开始/停止 ---------------------------- */
 async function startListening() {
+  clearTimeout(state.asr.stopFallback);
+  clearTimeout(state.restartTimer);
+  state.asr.failures = 0;
+  state.asr.downSince = 0;
+  if (asrEngine() === "server") {
+    state.manualStop = false;
+    state.listening = true;
+    renderMic(true);
+    els.liveArea.hidden = false;
+    els.liveText.textContent = "";
+    setStatus("连接识别服务…");
+    const ok = await startServerListening();
+    if (ok === true) return;
+    if (ok === "denied" || !state.listening) { state.listening = false; renderMic(false); setStatus("待命"); return; }
+    setStatus("服务器识别启动失败，改用浏览器识别");
+  }
+  await startBrowserListening();
+}
+
+async function startBrowserListening() {
   if (!SpeechRecognition) {
-    alert("请使用 Chrome / Edge 浏览器打开。");
+    alert("当前浏览器不支持语音识别，请使用 Chrome / Edge，或在服务器识别可用时选择「服务器识别」。");
+    state.listening = false;
+    renderMic(false);
     return;
   }
   state.manualStop = false;
   state.listening = true;
   try { await navigator.mediaDevices.getUserMedia({ audio: true }); }
-  catch { alert("无法访问麦克风，请检查系统权限设置。"); state.listening = false; return; }
+  catch { alert("无法访问麦克风，请检查系统权限设置。"); state.listening = false; renderMic(false); return; }
 
-  clearTimeout(state.asr.stopFallback);
-  clearTimeout(state.restartTimer);
   state.asr.failures = 0;
   state.asr.downSince = 0;
   state.recognition = buildRecognition();
@@ -1068,6 +1329,12 @@ function stopListening(hard = false) {
   clearTimeout(state.restartTimer);
   clearTimeout(state.pauseTimer);
   clearTimeout(state.asr.startWatchdog);
+  if (state.srv) {
+    stopServerListening();
+    stopTts();
+    renderMic(false);
+    return;
+  }
   const rec = state.recognition;
   const active = rec && (state.asr.phase === "listening" || state.asr.phase === "starting");
   if (active) {
@@ -1129,7 +1396,7 @@ function saveSettings() {
   localStorage.setItem("lt.settings", JSON.stringify({
     tgt: els.selTgt.value, mode: els.selMode.value, engine: els.selEngine.value,
     voiceURI: els.selVoice.value, rate: els.rngRate.value, font: els.rngFont.value,
-    theme: els.selTheme.value,
+    theme: els.selTheme.value, asr: els.selAsr.value,
   }));
 }
 function loadSettings() {
@@ -1138,6 +1405,7 @@ function loadSettings() {
     if (s.tgt) els.selTgt.value = s.tgt;
     if (s.mode) els.selMode.value = s.mode;
     if (s.engine) els.selEngine.value = s.engine;
+    if (s.asr) els.selAsr.value = s.asr;
     if (s.voiceURI) els.selVoice.dataset.want = s.voiceURI;
     if (s.rate) { els.rngRate.value = s.rate; els.rateVal.textContent = Number(s.rate).toFixed(1) + "x"; }
     if (s.font) { els.rngFont.value = s.font; applyFont(s.font); }
@@ -1164,7 +1432,7 @@ els.btnSwap.onclick = () => {
   if (state.listening) { try { state.recognition.stop(); } catch { /* restart onend */ } }
 };
 
-[els.selTgt, els.selMode, els.selEngine].forEach((el) => el.addEventListener("change", saveSettings));
+[els.selTgt, els.selMode, els.selEngine, els.selAsr].forEach((el) => el.addEventListener("change", saveSettings));
 els.selTheme.addEventListener("change", () => { applyTheme(els.selTheme.value); saveSettings(); });
 /* 「自动」识别时 rec.lang 由目标语言反推，改语言需重启识别会话才生效 */
 [els.selSrc, els.selTgt].forEach((el) =>
