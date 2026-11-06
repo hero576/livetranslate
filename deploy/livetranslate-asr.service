@@ -14,6 +14,7 @@ Environment=ASR_VAD_MODEL=/opt/asr/models/silero_vad.onnx
 Environment=ASR_THREADS=1
 Environment=ASR_WORKERS=2
 Environment=ASR_MAX_STREAMS=4
+Environment=ASR_MAX_SEG=10
 ExecStart=/opt/asr/venv/bin/python /opt/asr/server.py
 Restart=always
 RestartSec=3

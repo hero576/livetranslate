@@ -9,7 +9,8 @@ docs/asr/v2.1.0-server-asr.md。
   客户端 -> {"type":"stop"}                     停止：把未结束的语音段识别完再回 end
   服务端 -> {"type":"ready"}
   服务端 -> {"type":"partial","seg":n,"text":...}  当前语音段的临时结果（会被修订）
-  服务端 -> {"type":"final","seg":n,"text":...,"start":秒,"end":秒,"lang":...,"decode_ms":...}
+  服务端 -> {"type":"final","seg":n,"text":...,"start":秒,"end":秒,"lang":...,"decode_ms":...[,"cut":true]}
+            cut=true 表示连续说话超过 ASR_MAX_SEG 被强制切开，后面的话进入下一段
   服务端 -> {"type":"end"}
 """
 
@@ -28,6 +29,9 @@ import websockets
 SR = 16000
 VAD_WINDOW = 512
 PREROLL = int(0.4 * SR)  # partial 从检测到语音前 0.4 秒开始，避免吃掉开头的字（VAD 判定有延迟）
+GAP_JOIN = int(1.0 * SR)  # 距上一段末尾不到 1 秒就把中间整段补上（VAD 超长切段时会把切口附近的字判成静音）
+CUT_FRAME = int(0.03 * SR)  # 强制切段时按 30ms 一帧找最安静的位置
+MIN_TAIL = int(0.2 * SR)    # 强制切段后 VAD 再交来的尾巴短于这个就不识别
 LANG_TAGS = {"zh", "en", "yue", "ja", "ko"}
 
 log = logging.getLogger("asr")
@@ -44,7 +48,10 @@ def parse_args():
     p.add_argument("--max-streams", type=int, default=int(os.environ.get("ASR_MAX_STREAMS", "4")))
     # 两次临时识别之间至少间隔的音频时长；语音段越长，单次解码越慢，间隔会自动拉长
     p.add_argument("--partial-interval", type=float, default=float(os.environ.get("ASR_PARTIAL_INTERVAL", "0.8")))
-    p.add_argument("--max-speech", type=float, default=float(os.environ.get("ASR_MAX_SPEECH", "15")))
+    # 单段硬上限：连续说话超过这么长，在后半段最安静处切开先出 final。
+    # Silero VAD 自己的 max_speech 只是临时调高阈值，实测会放出 16～23 秒的段，单次解码慢、内存涨
+    p.add_argument("--max-seg", type=float, default=float(os.environ.get("ASR_MAX_SEG", "10")))
+    p.add_argument("--max-speech", type=float, default=float(os.environ.get("ASR_MAX_SPEECH", "30")))
     p.add_argument("--min-silence", type=float, default=float(os.environ.get("ASR_MIN_SILENCE", "0.5")))
     return p.parse_args()
 
@@ -97,11 +104,11 @@ class Session:
         self.pending = np.zeros(0, dtype=np.float32)  # 还没喂给 VAD 的尾巴（不足一个窗口）
         self.fed = 0               # 已喂给 VAD 的总采样数
         self.seg = 0               # 当前语音段编号（final 后 +1）
-        self.speech = []           # 当前语音段（VAD 检测到语音后）的音频，用于 partial
-        self.recent = np.zeros(0, dtype=np.float32)  # 最近 PREROLL 的音频，语音开始时补到 partial 前面
-        self.pre = np.zeros(0, dtype=np.float32)  # 语音开始时的 recent 快照
-        self.pre_end = 0           # pre 末尾对应的绝对采样位置
-        self.last_end = 0          # 上一个 final 末尾的绝对采样位置，补 pre-roll 不越过它
+        self.speech = []           # 当前语音段的音频（含 pre-roll，从 speech_start 起连续到 fed）
+        self.speech_start = 0      # speech 第一个采样的绝对位置
+        self.speech_len = 0        # speech 的总采样数
+        self.recent = np.zeros(0, dtype=np.float32)  # 最近 GAP_JOIN 的音频，语音开始时补到段首
+        self.last_end = 0          # 上一个 final 末尾的绝对采样位置，补 pre-roll 不越过它，VAD 交来的段也从这里截
         self.in_speech = False
         self.since_partial = 0     # 距上次 partial 新增的采样数
         self.partial_task = None
@@ -125,17 +132,24 @@ class Session:
         self.pending = buf[n:].copy()
         self.fed += n
         if n:
-            if self.vad.is_speech_detected():
-                if not self.in_speech:
-                    self.in_speech = True
-                    self.speech = [self.recent]
-                    self.pre = self.recent
-                    self.pre_end = self.fed - n
-                    self.since_partial = 0
+            if self.vad.is_speech_detected() and not self.in_speech:
+                # VAD 判定语音开始有延迟，段首常被吃掉一两个字：带上之前最多 0.4 秒，但不越过上一段末尾
+                gap = max(0, self.fed - n - self.last_end)
+                k = min(self.recent.size, gap if gap <= GAP_JOIN else PREROLL)
+                pre = self.recent[self.recent.size - k:]
+                self.in_speech = True
+                self.speech = [pre]
+                self.speech_len = pre.size
+                self.speech_start = self.fed - n - pre.size
+                self.since_partial = 0
+            if self.in_speech:
                 self.speech.append(buf[:n])
+                self.speech_len += n
                 self.since_partial += n
-            self.recent = np.concatenate([self.recent, buf[:n]])[-PREROLL:]
+            self.recent = np.concatenate([self.recent, buf[:n]])[-GAP_JOIN:]
             await self.drain()
+            if self.in_speech and self.speech_len >= self.e.args.max_seg * SR:
+                await self.force_cut()
             self.maybe_partial()
 
     def maybe_partial(self):
@@ -156,30 +170,69 @@ class Session:
         if text and seg == self.seg and self.in_speech:
             await self.send({"type": "partial", "seg": seg, "text": text})
 
+    async def split(self, at, cut=False):
+        """把当前语音段在绝对位置 at 处切开：前面出 final，后面留作下一段的开头。"""
+        audio = np.concatenate(self.speech) if self.speech else np.zeros(0, dtype=np.float32)
+        k = min(max(at - self.speech_start, 0), audio.size)
+        start = self.speech_start
+        self.speech = [audio[k:]]
+        self.speech_len = audio.size - k
+        self.speech_start = start + k
+        self.since_partial = self.speech_len
+        self.last_end = self.speech_start
+        await self.emit_final(audio[:k], start, cut)
+
+    def end_speech(self):
+        self.in_speech = False
+        self.speech = []
+        self.speech_len = 0
+        self.since_partial = 0
+
+    async def force_cut(self):
+        """连续说话太长：在后半段最安静的 30ms 处切开，前半段立即出 final，后半段接着当新的一段。"""
+        audio = np.concatenate(self.speech)
+        lo = audio.size // 2
+        hi = audio.size - MIN_TAIL
+        frames = audio[lo:hi][: (hi - lo) // CUT_FRAME * CUT_FRAME].reshape(-1, CUT_FRAME)
+        cut = lo + int(np.argmin((frames ** 2).mean(axis=1))) * CUT_FRAME + CUT_FRAME // 2
+        await self.split(self.speech_start + cut, cut=True)
+
     async def drain(self):
-        """VAD 产出的完整语音段：按顺序识别、发 final。"""
+        """VAD 产出的完整语音段：只用它的结束位置。音频取自本地连续记录的当前段，
+        这样 VAD 自己超长切段时两段之间被它判成静音的那一小截也不会丢。"""
         while not self.vad.empty():
             front = self.vad.front
-            samples = np.array(front.samples, dtype=np.float32)
             s0 = front.start
+            e = s0 + len(front.samples)
+            if not self.in_speech:  # 兜底：没跟踪到这段的开始，直接用 VAD 的音频
+                samples = np.array(front.samples, dtype=np.float32)
+                self.vad.pop()
+                if s0 < self.last_end:
+                    samples = samples[self.last_end - s0:]
+                    s0 = self.last_end
+                self.last_end = s0 + samples.size
+                await self.emit_final(samples, s0)
+                continue
             self.vad.pop()
-            # VAD 判定语音开始有延迟，段首常被吃掉一两个字：用 pre-roll 补回，但不越过上一段末尾
-            lo = max(self.pre_end - self.pre.size, s0 - PREROLL, self.last_end)
-            if lo < s0 <= self.pre_end:
-                samples = np.concatenate([self.pre[lo - (self.pre_end - self.pre.size):s0 - (self.pre_end - self.pre.size)], samples])
-                s0 = lo
-            self.last_end = s0 + samples.size
-            start = s0 / SR
-            seg = self.seg
-            self.seg += 1
-            self.in_speech = False
-            self.speech = []
-            self.since_partial = 0
+            await self.split(e)
+            if not self.vad.is_speech_detected():
+                self.end_speech()
+
+    async def emit_final(self, samples, s0, cut=False):
+        seg = self.seg
+        self.seg += 1
+        if samples.size < MIN_TAIL:  # 只剩一点尾音：发空 final，让前端撤掉这一段的临时气泡
+            text, lang, ms = "", "", 0
+        else:
             text, lang, ms = await self.e.run_decode(samples)
-            end = start + samples.size / SR
-            await self.send({"type": "final", "seg": seg, "text": text, "start": round(start, 2),
-                             "end": round(end, 2), "lang": lang, "decode_ms": ms})
-            log.info("final seg=%d %.1fs decode=%dms %s", seg, samples.size / SR, ms, text[:40])
+        start = s0 / SR
+        msg = {"type": "final", "seg": seg, "text": text, "start": round(start, 2),
+               "end": round(start + samples.size / SR, 2), "lang": lang, "decode_ms": ms}
+        if cut:
+            msg["cut"] = True
+        await self.send(msg)
+        log.info("final seg=%d %.2f-%.2fs decode=%dms%s %s", seg, start, start + samples.size / SR, ms,
+                 " cut" if cut else "", text[:40])
 
     async def stop(self):
         if self.partial_task and not self.partial_task.done():
@@ -187,9 +240,16 @@ class Session:
         if self.pending.size:
             pad = np.zeros(VAD_WINDOW - self.pending.size, dtype=np.float32)
             self.vad.accept_waveform(np.concatenate([self.pending, pad]))
+            self.fed += VAD_WINDOW
+            if self.in_speech:
+                self.speech.append(np.concatenate([self.pending, pad]))
+                self.speech_len += VAD_WINDOW
             self.pending = np.zeros(0, dtype=np.float32)
         self.vad.flush()
         await self.drain()
+        if self.in_speech and self.speech_len >= MIN_TAIL:
+            await self.split(self.speech_start + self.speech_len)
+        self.end_speech()
         await self.send({"type": "end"})
 
 
