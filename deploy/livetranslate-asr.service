@@ -1,0 +1,25 @@
+[Unit]
+Description=LiveTranslate ASR (SenseVoice + Silero VAD, local only :8011)
+After=network.target
+
+[Service]
+Type=simple
+User=www
+Group=www
+WorkingDirectory=/opt/asr
+Environment=ASR_HOST=127.0.0.1
+Environment=ASR_PORT=8011
+Environment=ASR_MODEL_DIR=/opt/asr/models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09
+Environment=ASR_VAD_MODEL=/opt/asr/models/silero_vad.onnx
+Environment=ASR_THREADS=1
+Environment=ASR_WORKERS=2
+Environment=ASR_MAX_STREAMS=4
+Environment=ASR_MAX_SEG=10
+ExecStart=/opt/asr/venv/bin/python /opt/asr/server.py
+Restart=always
+RestartSec=3
+Nice=5
+MemoryLimit=1200M
+
+[Install]
+WantedBy=multi-user.target

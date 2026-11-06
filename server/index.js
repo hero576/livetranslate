@@ -1,4 +1,5 @@
 import express from "express";
+import { WebSocketServer, WebSocket } from "ws";
 import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
@@ -485,9 +486,83 @@ async function doTranslate(res, clean, resolvedFrom, to, engine, ck) {
   res.status(502).json({ ok: false, error: "all engines failed", detail: errors });
 }
 
+/* ------------------------------------------------------------------ *
+ * 服务端语音识别：浏览器 WebSocket(/api/asr) → 本机 ASR 服务（asr/server.py）
+ * Node 只做鉴权和逐帧转发，识别协议见 docs/asr/v2.1.0-server-asr.md。
+ * 未配置 ASR_URL 时关闭，前端自动回到浏览器识别。
+ * ------------------------------------------------------------------ */
+const ASR_URL = (process.env.ASR_URL || "").trim();
+const ASR_PENDING_MAX = 8 * 1024 * 1024; // 上游未连上时最多缓存的字节数（约 4 分钟 16k PCM）
+
+app.get("/api/asr/status", (_req, res) => res.json({ ok: true, enabled: !!ASR_URL }));
+
+async function asrUser(req) {
+  const url = new URL(req.url, "http://x");
+  const s = SESSIONS.get(url.searchParams.get("token") || "");
+  if (!s || Date.now() > s.expires) return null;
+  const u = await store.getUserById(s.userId);
+  return u && u.status === "active" && !u.mustChangePwd ? u : null;
+}
+
+function attachAsrProxy(server) {
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 1 << 20 });
+  server.on("upgrade", async (req, socket, head) => {
+    if (!req.url.startsWith("/api/asr")) { socket.destroy(); return; }
+    const user = ASR_URL ? await asrUser(req).catch(() => null) : null;
+    if (!user) {
+      socket.write(`HTTP/1.1 ${ASR_URL ? "401 Unauthorized" : "503 Service Unavailable"}\r\nConnection: close\r\n\r\n`);
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (client) => relayAsr(client, user));
+  });
+}
+
+function relayAsr(client, user) {
+  const t0 = Date.now();
+  let bytes = 0;
+  const pending = [];
+  let pendingBytes = 0;
+  const upstream = new WebSocket(ASR_URL, { maxPayload: 1 << 20 });
+  const closeBoth = (code = 1000, reason = "") => {
+    for (const ws of [client, upstream]) {
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        try { ws.close(code, reason); } catch { ws.terminate(); }
+      }
+    }
+  };
+  client.on("message", (data, isBinary) => {
+    if (isBinary) bytes += data.length;
+    if (upstream.readyState === WebSocket.OPEN) return upstream.send(data, { binary: isBinary });
+    pendingBytes += data.length;
+    if (pendingBytes > ASR_PENDING_MAX) return closeBoth(1011, "asr upstream not ready");
+    pending.push([data, isBinary]);
+  });
+  upstream.on("open", () => {
+    for (const [d, b] of pending.splice(0)) upstream.send(d, { binary: b });
+  });
+  upstream.on("message", (data, isBinary) => {
+    if (client.readyState === WebSocket.OPEN) client.send(data, { binary: isBinary });
+  });
+  upstream.on("error", (e) => {
+    console.error("[asr] upstream error:", e.message);
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(JSON.stringify({ type: "error", error: "upstream", message: "识别服务不可用" }));
+    }
+    closeBoth(1011, "asr upstream error");
+  });
+  upstream.on("close", (code) => closeBoth(code === 1005 ? 1000 : code));
+  client.on("close", () => {
+    closeBoth();
+    console.log(`[asr] ${user.username} session ${Math.round((Date.now() - t0) / 1000)}s, audio ${(bytes / 32000).toFixed(0)}s`);
+  });
+  client.on("error", () => closeBoth());
+}
+
 /* ---------------------------- 基础 ---------------------------- */
 app.get("/api/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
 app.get("*", (_req, res) => res.sendFile(path.join(__dirname, "..", "public", "index.html")));
 
-app.listen(PORT, () => console.log(`LiveTranslate listening on :${PORT}`));
+const server = app.listen(PORT, () => console.log(`LiveTranslate listening on :${PORT}${ASR_URL ? ` · ASR → ${ASR_URL}` : ""}`));
+attachAsrProxy(server);
